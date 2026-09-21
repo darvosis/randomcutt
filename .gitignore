@@ -1,0 +1,23 @@
+# Build de PyInstaller
+build/
+dist/
+*.spec
+.venv-build/
+
+# Python
+__pycache__/
+*.py[cod]
+.libs/
+
+# Carpetas de trabajo local (material de video, no va al repo)
+out/
+GUI/
+*.mov
+*.mp4
+*.mkv
+*.avi
+
+# Sistema
+Thumbs.db
+desktop.ini
+.DS_Store
