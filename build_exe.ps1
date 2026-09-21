@@ -1,4 +1,4 @@
-<#
+﻿<#
     build_exe.ps1 - compila randomcutt a un .exe autocontenido (Windows).
 
     Uso:
@@ -6,8 +6,11 @@
         powershell -ExecutionPolicy Bypass -File build_exe.ps1 -Clean
 
     Crea un venv aislado en .venv-build (no toca tu Python base), instala
-    PyInstaller ahi y deja el ejecutable en dist\randomcutt.exe.
-    ffmpeg NO se empaqueta: la app lo busca en el PATH al arrancar.
+    PyInstaller ahí y deja el ejecutable en dist\randomcutt.exe.
+    ffmpeg NO se empaqueta: la app lo busca en el PATH al iniciar.
+
+    Este archivo va en UTF-8 con BOM: sin BOM, Windows PowerShell 5.1 lo lee
+    como ANSI y las tildes de los mensajes salen corruptas.
 #>
 param(
     [switch]$Clean,
@@ -39,23 +42,23 @@ if (-not $Python) {
     $guess = "$env:USERPROFILE\miniconda3\python.exe"
     if (Test-Path $guess) { $Python = $guess }
 }
-if (-not $Python) { throw "No encontre un Python real. Pasa -Python C:\ruta\python.exe" }
+if (-not $Python) { throw "No encontré un Python real. Indica uno con -Python C:\ruta\python.exe" }
 Write-Host "Python base: $Python"
 
 # --- venv de build ---------------------------------------------------------
 if (-not (Test-Path $vpy)) {
     Write-Host "creando venv de build ..."
     & $Python -m venv $venv
-    if ($LASTEXITCODE -ne 0) { throw "fallo creando el venv" }
+    if ($LASTEXITCODE -ne 0) { throw "falló la creación del venv" }
 }
 & $vpy -m pip install --upgrade pip --quiet
 & $vpy -m pip install --upgrade pyinstaller --quiet
-if ($LASTEXITCODE -ne 0) { throw "fallo instalando pyinstaller" }
+if ($LASTEXITCODE -ne 0) { throw "falló la instalación de PyInstaller" }
 & $vpy -c "import tkinter"
-if ($LASTEXITCODE -ne 0) { throw "ese Python no trae tkinter; usa otro con -Python" }
+if ($LASTEXITCODE -ne 0) { throw "ese Python no incluye tkinter; usa otro con -Python" }
 
 # Anaconda/Miniconda guardan tcl86t.dll y tk86t.dll en Library\bin, no en DLLs.
-# Sin esto PyInstaller no las empaqueta y el .exe muere al arrancar con
+# Sin esto PyInstaller no las empaqueta y el .exe falla al iniciar con
 # "ImportError: DLL load failed while importing _tkinter".
 $condaBin = Join-Path (Split-Path -Parent $Python) "Library\bin"
 if (Test-Path (Join-Path $condaBin "tk86t.dll")) {
@@ -63,7 +66,7 @@ if (Test-Path (Join-Path $condaBin "tk86t.dll")) {
     $env:PATH = "$condaBin;$env:PATH"
 }
 
-# El cache de Analysis no percibe los cambios de PATH: arrancar siempre limpio.
+# La caché de Analysis no detecta los cambios de PATH: empezar siempre desde cero.
 if (Test-Path "build") { Remove-Item "build" -Recurse -Force }
 
 # Un randomcutt.exe abierto bloquea el archivo de salida.
@@ -73,7 +76,8 @@ Get-Process randomcutt -ErrorAction SilentlyContinue | ForEach-Object {
 }
 
 # --- build -----------------------------------------------------------------
-$args = @(
+# $args es una variable automática de PowerShell: no reutilizar ese nombre.
+$pyiArgs = @(
     "--noconfirm", "--onefile", "--windowed",
     "--name", "randomcutt",
     "--icon", "randomcutt.ico",
@@ -85,8 +89,8 @@ $args = @(
     "randomcutt_v007.py"
 )
 Write-Host "compilando ..."
-& $vpy -m PyInstaller @args
-if ($LASTEXITCODE -ne 0) { throw "pyinstaller fallo" }
+& $vpy -m PyInstaller @pyiArgs
+if ($LASTEXITCODE -ne 0) { throw "PyInstaller falló" }
 
 $exe = Join-Path $root "dist\randomcutt.exe"
 $mb = [math]::Round((Get-Item $exe).Length / 1MB, 1)

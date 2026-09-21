@@ -3,10 +3,10 @@
 randomcutt - extractor de clips random para VJ / TouchDesigner
 ==============================================================
 
-Saca N clips de duracion fija desde un video largo y los exporta en HAP
-(u otro codec) para alimentar videocutter / moviefilein en TouchDesigner.
+Saca N clips de duración fija desde un video largo y los exporta en HAP
+(u otro códec) para alimentar videocutter / moviefilein en TouchDesigner.
 
-v007 - GUI nueva + ffmpeg auto-detectado + fixes de v006.
+v0.8.0 - GUI, modo carpeta (lote) y detección automática de ffmpeg.
 Un solo archivo, sin dependencias externas (solo stdlib + ffmpeg/ffprobe).
 """
 
@@ -16,6 +16,7 @@ import json
 import os
 import queue
 import random
+import re
 import shutil
 import subprocess
 import sys
@@ -27,7 +28,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 APP_NAME = "randomcutt"
-APP_VERSION = "0.7.0"
+APP_VERSION = "0.8.0"
 
 VIDEO_TYPES = [
     ("Video", "*.mp4 *.mov *.mkv *.avi *.m4v *.webm *.mpg *.mpeg *.ts *.wmv *.flv"),
@@ -69,13 +70,24 @@ CODEC_EXT = {
 HAP_FORMATS = ["hap", "hap_alpha", "hap_q"]
 DISTRIBUCIONES = ["Random puro", "Estratificado", "Lineal"]
 
+MODOS = ["Archivo", "Carpeta"]
+SALIDAS = ["Subcarpeta por video", "Todo en una carpeta", "Junto al video de origen"]
+
+VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".avi", ".m4v", ".webm",
+              ".mpg", ".mpeg", ".ts", ".wmv", ".flv"}
+# Tamaño mínimo para descartar stubs que no son video (los sidecars AppleDouble
+# ._nombre.mkv pesan ~4 KB). Bajo a propósito: un clip corto de verdad puede
+# pesar unos pocos cientos de KB y tiene que pasar.
+MIN_SOURCE_BYTES = 64 << 10
+CLIP_RE = re.compile(r"_clip_\d+", re.IGNORECASE)
+
 
 # --------------------------------------------------------------------------
 # Utilidades de proceso / ffmpeg
 # --------------------------------------------------------------------------
 
 def app_dir() -> Path:
-    """Carpeta del .exe (congelado) o del .py. Aca se busca un ffmpeg portable."""
+    """Carpeta del .exe (congelado) o del .py. Aquí se busca un ffmpeg portable."""
     if getattr(sys, "frozen", False):
         return Path(sys.executable).parent
     return Path(__file__).resolve().parent
@@ -97,7 +109,7 @@ def _no_window_kwargs() -> dict:
 
 
 def find_tool(name: str, override_dir: str | None = None) -> str | None:
-    """Busca ffmpeg/ffprobe: override -> junto al exe -> PATH -> rutas tipicas."""
+    """Busca ffmpeg/ffprobe: override -> junto al exe -> PATH -> rutas típicas."""
     exe = name + (".exe" if IS_WIN else "")
     cands: list[Path] = []
 
@@ -141,7 +153,7 @@ def find_tool(name: str, override_dir: str | None = None) -> str | None:
 
 
 def probe(ffprobe: str, path: str) -> dict:
-    """Devuelve duracion / codec / resolucion / fps / audio del archivo."""
+    """Devuelve duración / códec / resolución / fps / audio del archivo."""
     cmd = [
         ffprobe, "-v", "error",
         "-show_entries",
@@ -153,7 +165,7 @@ def probe(ffprobe: str, path: str) -> dict:
                          errors="replace", stdin=subprocess.DEVNULL,
                          **_no_window_kwargs())
     if res.returncode != 0:
-        raise RuntimeError((res.stderr or "ffprobe fallo").strip())
+        raise RuntimeError((res.stderr or "ffprobe falló").strip())
 
     data = json.loads(res.stdout or "{}")
     streams = data.get("streams") or []
@@ -169,7 +181,7 @@ def probe(ffprobe: str, path: str) -> dict:
         except (TypeError, ValueError):
             continue
     if duration <= 0:
-        raise RuntimeError("No se pudo leer la duracion del video.")
+        raise RuntimeError("No se pudo leer la duración del video.")
 
     fps = 0.0
     try:
@@ -197,12 +209,12 @@ def fmt_dur(seconds: float) -> str:
 
 
 # --------------------------------------------------------------------------
-# Logica de corte
+# Lógica de corte
 # --------------------------------------------------------------------------
 
 def compute_starts(total: float, clip_dur: float, n: int,
                    mode: str, spread: float, rng: random.Random) -> list[float]:
-    """Puntos de inicio de cada clip segun la distribucion elegida."""
+    """Puntos de inicio de cada clip según la distribución elegida."""
     span = max(0.0, total - clip_dur)
     if span <= 0:
         return [0.0] * n
@@ -220,8 +232,51 @@ def compute_starts(total: float, clip_dur: float, n: int,
             out.append(min(max(centre + jitter, 0.0), span))
         return out
 
-    # Random puro (comportamiento historico de v006)
+    # Random puro (comportamiento histórico de v006)
     return [rng.uniform(0.0, span) for _ in range(n)]
+
+
+def collect_sources(folder: str, recursive: bool, skip_clips: bool) -> list[Path]:
+    """Videos usables dentro de una carpeta, ordenados por nombre."""
+    root = Path(folder)
+    try:
+        it = root.rglob("*") if recursive else root.glob("*")
+    except OSError:
+        return []
+    out: list[Path] = []
+    for p in it:
+        try:
+            if p.suffix.lower() not in VIDEO_EXTS or not p.is_file():
+                continue
+            if p.name.startswith("._"):                 # sidecar AppleDouble
+                continue
+            if p.stat().st_size < MIN_SOURCE_BYTES:
+                continue
+            if skip_clips and CLIP_RE.search(p.stem):   # ya es un clip generado
+                continue
+        except OSError:
+            continue
+        out.append(p)
+    return sorted(out, key=lambda q: str(q).lower())
+
+
+def output_dir_for(src: Path, cfg: dict) -> Path:
+    """Dónde caen los clips de este video, según cómo se quiera organizar."""
+    modo = cfg["salida_modo"]
+    if modo == "Junto al video de origen":
+        return src.parent
+    base = Path(cfg["outdir"])
+    return base / src.stem if modo == "Subcarpeta por video" else base
+
+
+def already_done(outdir: Path, stem: str) -> int:
+    """Cuántos clips de este video ya existen en su carpeta de salida."""
+    prefix = f"{stem.lower()}_clip_"
+    try:
+        return sum(1 for p in outdir.iterdir()
+                   if p.is_file() and p.stem.lower().startswith(prefix))
+    except OSError:
+        return 0
 
 
 def unique_path(path: Path, reserved: set) -> Path:
@@ -249,7 +304,7 @@ def build_cmd(ffmpeg: str, src: str, start: float, dur: float, out: Path,
     if want_audio:
         cmd += ["-map", "0:a:0?"]
 
-    # HAP exige ancho y alto multiplos de 4 o el encoder aborta.
+    # HAP exige ancho y alto múltiplos de 4 o el encoder aborta.
     if codec == "hap" and (info["width"] % 4 or info["height"] % 4):
         if cfg["align"] == "crop":
             cmd += ["-vf", "crop=trunc(iw/4)*4:trunc(ih/4)*4"]
@@ -312,63 +367,126 @@ class Renderer:
             self._run(cfg)
         except Exception as exc:                                  # noqa: BLE001
             self.log(f"ERROR: {exc}", "err")
-            self.emit("done", {"ok": 0, "fail": 0, "aborted": True,
+            self.emit("done", {"ok": 0, "fail": 0, "skipped": 0, "aborted": True,
                                "outdir": cfg.get("outdir", "")})
 
     def _run(self, cfg: dict):
         t0 = time.time()
-        src = cfg["input"]
 
-        self.log(f"Analizando {Path(src).name} ...")
-        info = probe(cfg["ffprobe"], src)
-        self.log(
-            "  {codec}  {w}x{h}  {fps:.3f} fps  {dur}  audio: {a}".format(
-                codec=info["codec"], w=info["width"], h=info["height"],
-                fps=info["fps"], dur=fmt_dur(info["duration"]),
-                a="si" if info["has_audio"] else "no"),
-            "muted")
-
-        n = cfg["clips"]
-        dur = cfg["duration"]
-        if info["duration"] <= dur:
-            self.log(
-                f"AVISO: el video dura {info['duration']:.2f}s y pediste clips de "
-                f"{dur:g}s. Todos los clips arrancan en 0.", "warn")
-
-        if cfg["codec"] == "hap" and (info["width"] % 4 or info["height"] % 4):
-            verb = "recortando" if cfg["align"] == "crop" else "rellenando"
-            self.log(
-                f"AVISO: {info['width']}x{info['height']} no es multiplo de 4 "
-                f"(HAP lo exige) -> {verb} al multiplo mas cercano.", "warn")
+        if cfg["batch"]:
+            sources = collect_sources(cfg["input"], cfg["recursive"],
+                                      cfg["skip_clips"])
+            if not sources:
+                self.log("No encontré videos usables en esa carpeta.", "err")
+                self.emit("done", {"ok": 0, "fail": 0, "skipped": 0,
+                                   "aborted": False, "outdir": cfg["outdir"]})
+                return
+            self.log(f"{len(sources)} videos en {cfg['input']}")
+        else:
+            sources = [Path(cfg["input"])]
 
         if cfg["codec"] == "copy":
             self.log("AVISO: con 'copy' el corte salta al keyframe anterior; "
-                     "la duracion real puede variar.", "warn")
+                     "la duración real puede variar.", "warn")
 
-        rng = random.Random(cfg["seed"]) if cfg["seed"] is not None else random.Random()
+        n = cfg["clips"]
+        state = {"done": 0, "total": len(sources) * n, "t0": t0}
+        self._emit_progress(state)
+
+        tot = {"ok": 0, "fail": 0, "skipped": 0}
+        for i, src in enumerate(sources):
+            if self.cancel.is_set():
+                break
+            if len(sources) > 1:
+                self.log("")
+                self.log(f"[{i + 1}/{len(sources)}] {src.name}")
+            else:
+                self.log(f"Analizando {src.name} ...")
+            res = self._run_source(src, cfg, state)
+            for k in tot:
+                tot[k] += res[k]
+
+        aborted = self.cancel.is_set()
+        bits = [f"{tot['ok']} clips en {time.time() - t0:.1f}s"]
+        if tot["fail"]:
+            bits.append(f"{tot['fail']} con error")
+        if tot["skipped"]:
+            bits.append(f"{tot['skipped']} videos omitidos")
+        self.log("")
+        self.log(("Cancelado: " if aborted else "Listo: ") + ", ".join(bits),
+                 "err" if tot["fail"] else "ok")
+        self.emit("done", {**tot, "aborted": aborted, "outdir": cfg["outdir"]})
+
+    def _emit_progress(self, state: dict):
+        done, total = state["done"], state["total"]
+        elapsed = time.time() - state["t0"]
+        eta = (elapsed / done) * (total - done) if done else None
+        self.emit("progress", {"done": done, "total": total, "eta": eta})
+
+    def _skip_rest(self, state: dict, n: int, key: str) -> dict:
+        """Este video no se procesa: avanzar la barra igual y contar aparte."""
+        state["done"] += n
+        self._emit_progress(state)
+        return {"ok": 0, "fail": 0, "skipped": 0, key: 1}
+
+    def _run_source(self, src: Path, cfg: dict, state: dict) -> dict:
+        n, dur = cfg["clips"], cfg["duration"]
+        outdir = output_dir_for(src, cfg)
+
+        if cfg["batch"] and cfg["skip_done"]:
+            have = already_done(outdir, src.stem)
+            if have:
+                self.log(f"  omitido: {outdir.name} ya tiene {have} clips",
+                         "muted")
+                return self._skip_rest(state, n, "skipped")
+
+        try:
+            info = probe(cfg["ffprobe"], str(src))
+        except (RuntimeError, ValueError, OSError) as exc:
+            self.log(f"  FALLO al leer: {exc}", "err")
+            return self._skip_rest(state, n, "fail")
+
+        self.log(
+            "  {codec}  {w}x{h}  {fps:.3f} fps  {d}  audio: {a}".format(
+                codec=info["codec"], w=info["width"], h=info["height"],
+                fps=info["fps"], d=fmt_dur(info["duration"]),
+                a="sí" if info["has_audio"] else "no"),
+            "muted")
+
+        if info["duration"] <= dur:
+            self.log(f"  AVISO: el video dura {info['duration']:.2f}s y pediste "
+                     f"clips de {dur:g}s. Todos empiezan en 0.", "warn")
+        if cfg["codec"] == "hap" and (info["width"] % 4 or info["height"] % 4):
+            verb = "recortando" if cfg["align"] == "crop" else "rellenando"
+            self.log(f"  AVISO: {info['width']}x{info['height']} no es múltiplo "
+                     f"de 4 (HAP lo exige) -> {verb}.", "warn")
+
+        try:
+            outdir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            self.log(f"  FALLO: no pude crear {outdir}: {exc}", "err")
+            return self._skip_rest(state, n, "fail")
+
+        # Seed derivado del nombre: el lote entero es reproducible, pero cada
+        # video recibe su propia tirada.
+        rng = (random.Random(f"{cfg['seed']}:{src.name}")
+               if cfg["seed"] is not None else random.Random())
         starts = compute_starts(info["duration"], dur, n,
                                 cfg["distribucion"], cfg["spread"], rng)
 
         # Nombres reservados de una sola vez: los workers corren en paralelo.
-        ext = Path(src).suffix if cfg["codec"] == "copy" else CODEC_EXT[cfg["codec"]]
-        stem = Path(src).stem
+        ext = src.suffix if cfg["codec"] == "copy" else CODEC_EXT[cfg["codec"]]
         sfx = cfg["suffix"]
-        outdir = Path(cfg["outdir"])
         reserved: set = set()
-        paths = [unique_path(outdir / f"{stem}_clip_{i + 1}{sfx}{ext}", reserved)
+        paths = [unique_path(outdir / f"{src.stem}_clip_{i + 1}{sfx}{ext}", reserved)
                  for i in range(n)]
 
-        self.log(f"Exportando {n} clips de {dur:g}s en {cfg['codec']} "
-                 f"({cfg['workers']} en paralelo) ...")
-        self.emit("progress", {"done": 0, "total": n, "eta": None})
-
-        ok = fail = done = 0
+        ok = fail = 0
         with ThreadPoolExecutor(max_workers=cfg["workers"]) as pool:
-            futures = [pool.submit(self._one, i, starts[i], paths[i], cfg, info)
+            futures = [pool.submit(self._one, src, i, starts[i], paths[i], cfg, info)
                        for i in range(n)]
             for fut in futures:
                 status, idx, detail = fut.result()
-                done += 1
                 if status == "ok":
                     ok += 1
                     self.log(f"  [{idx + 1}/{n}] {Path(detail).name}"
@@ -376,26 +494,20 @@ class Renderer:
                 elif status == "err":
                     fail += 1
                     self.log(f"  [{idx + 1}/{n}] FALLO: {detail}", "err")
-                elapsed = time.time() - t0
-                eta = (elapsed / done) * (n - done) if done else None
-                self.emit("progress", {"done": done, "total": n, "eta": eta})
+                state["done"] += 1
+                self._emit_progress(state)
 
-        aborted = self.cancel.is_set()
-        verb = "Cancelado" if aborted else "Listo"
-        self.log(f"{verb}: {ok} clips en {time.time() - t0:.1f}s"
-                 + (f", {fail} con error" if fail else ""),
-                 "err" if fail else "ok")
-        self.emit("done", {"ok": ok, "fail": fail, "aborted": aborted,
-                           "outdir": cfg["outdir"]})
+        return {"ok": ok, "fail": fail, "skipped": 0}
 
-    def _one(self, idx: int, start: float, out: Path, cfg: dict, info: dict):
+    def _one(self, src: Path, idx: int, start: float, out: Path,
+             cfg: dict, info: dict):
         if self.cancel.is_set():
             return ("skip", idx, "")
-        cmd = build_cmd(cfg["ffmpeg"], cfg["input"], start, cfg["duration"],
+        cmd = build_cmd(cfg["ffmpeg"], str(src), start, cfg["duration"],
                         out, cfg, info)
         try:
             # stdin=DEVNULL es obligatorio: congelado con --windowed el proceso
-            # no tiene handles estandar validos que heredar.
+            # no tiene handles estándar válidos que heredar.
             p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
                                  stdout=subprocess.DEVNULL,
                                  stderr=subprocess.PIPE, text=True,
@@ -419,7 +531,7 @@ class Renderer:
             return ("skip", idx, "")
         if p.returncode != 0:
             msg = " | ".join(l.strip() for l in (err or "").splitlines() if l.strip())
-            return ("err", idx, (msg or f"ffmpeg salio con codigo {p.returncode}")[-500:])
+            return ("err", idx, (msg or f"ffmpeg salió con código {p.returncode}")[-500:])
         return ("ok", idx, str(out))
 
 
@@ -456,13 +568,13 @@ def save_config(data: dict):
 # --------------------------------------------------------------------------
 
 def card(parent, title: str):
-    """Panel con borde de 1px, barra de acento y titulo. Devuelve (outer, body)."""
+    """Panel con borde de 1px, barra de acento y título. Devuelve (outer, body)."""
     outer = tk.Frame(parent, bg=C["border"])
     inner = tk.Frame(outer, bg=C["panel"])
     inner.pack(fill="both", expand=True, padx=1, pady=1)
 
     head = tk.Frame(inner, bg=C["panel"])
-    head.pack(fill="x", padx=14, pady=(12, 0))
+    head.pack(fill="x", padx=14, pady=(10, 0))
     bar = tk.Frame(head, bg=C["accent"], width=3, height=13)
     bar.pack(side="left", padx=(0, 9))
     bar.pack_propagate(False)
@@ -470,7 +582,7 @@ def card(parent, title: str):
              font=(UI_FONT, 10, "bold")).pack(side="left")
 
     body = tk.Frame(inner, bg=C["panel"])
-    body.pack(fill="both", expand=True, padx=14, pady=(10, 14))
+    body.pack(fill="both", expand=True, padx=14, pady=(8, 11))
     return outer, body
 
 
@@ -583,16 +695,30 @@ class App:
         self._build()
         self._sync_dist()
         self._sync_codec()
+        self._sync_salida()
+        if not self._is_batch():
+            self.frm_batch.grid_remove()
+        else:
+            self.lbl_input.configure(text="Carpeta con videos")
+            self.v_probe.set("sin carpeta")
         self._refresh_tools_label()
-        self._log("randomcutt listo. Elegi un video y una carpeta de salida.", "muted")
+        self._log("randomcutt listo. Elige un video y una carpeta de salida.", "muted")
         self._tick()
 
-        # Dimensionar segun lo que pide el layout: aguanta cualquier DPI/fuente.
+        # Dimensionar según lo que pide el layout: funciona con cualquier DPI/fuente.
+        # El tope evita que en una pantalla de 1080 el footer quede debajo de la
+        # barra de tareas; la consola absorbe el recorte porque es la fila que
+        # tiene weight.
         root.update_idletasks()
+        sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
         w = max(950, root.winfo_reqwidth())
-        h = root.winfo_reqheight()
-        root.geometry(f"{w}x{h}")
-        root.minsize(900, min(h, 780))
+        h = min(root.winfo_reqheight(), int(sh * 0.90))
+        # Posición explícita: si Windows la cascadea, el footer puede caer
+        # debajo de la barra de tareas. ~40 px de marco y ~48 de barra.
+        x = max(0, (sw - w) // 2)
+        y = max(0, (sh - 48 - (h + 40)) // 2)
+        root.geometry(f"{w}x{h}+{x}+{y}")
+        root.minsize(900, min(h, 700))
 
         root.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -600,6 +726,11 @@ class App:
     def _vars(self):
         c = self.cfg
         self.v_input = tk.StringVar()
+        self.v_mode = tk.StringVar(value=c.get("mode", "Archivo"))
+        self.v_recursive = tk.BooleanVar(value=bool(c.get("recursive", False)))
+        self.v_skip_clips = tk.BooleanVar(value=bool(c.get("skip_clips", True)))
+        self.v_skip_done = tk.BooleanVar(value=bool(c.get("skip_done", True)))
+        self.v_salida_modo = tk.StringVar(value=c.get("salida_modo", SALIDAS[0]))
         self.v_outdir = tk.StringVar(value=c.get("outdir", ""))
         self.v_clips = tk.StringVar(value=str(c.get("clips", 20)))
         self.v_dur = tk.StringVar(value=str(c.get("duration", 5)))
@@ -634,7 +765,7 @@ class App:
 
         # ---- header -----------------------------------------------------
         head = tk.Frame(root, bg=C["bg"])
-        head.grid(row=0, column=0, sticky="ew", padx=18, pady=(16, 10))
+        head.grid(row=0, column=0, sticky="ew", padx=18, pady=(12, 8))
         head.columnconfigure(1, weight=1)
 
         tit = tk.Frame(head, bg=C["bg"])
@@ -656,19 +787,19 @@ class App:
 
         self._card_origen(cols).grid(row=0, column=0, columnspan=2, sticky="ew")
         self._card_cortes(cols).grid(row=1, column=0, sticky="nsew",
-                                     padx=(0, 7), pady=(12, 0))
+                                     padx=(0, 7), pady=(9, 0))
         self._card_salida(cols).grid(row=1, column=1, sticky="nsew",
-                                     padx=(7, 0), pady=(12, 0))
+                                     padx=(7, 0), pady=(9, 0))
         self._card_avanzado(cols).grid(row=2, column=0, columnspan=2,
-                                       sticky="ew", pady=(12, 0))
+                                       sticky="ew", pady=(9, 0))
 
         # ---- consola ----------------------------------------------------
         logc, logb = card(root, "CONSOLA")
-        logc.grid(row=2, column=0, sticky="nsew", padx=18, pady=(12, 0))
+        logc.grid(row=2, column=0, sticky="nsew", padx=18, pady=(9, 0))
         logb.columnconfigure(0, weight=1)
         logb.rowconfigure(0, weight=1)
 
-        self.log = tk.Text(logb, height=8, bg=C["field"], fg=C["fg"],
+        self.log = tk.Text(logb, height=6, bg=C["field"], fg=C["fg"],
                            insertbackground=C["fg"], relief="flat", bd=0,
                            highlightthickness=1, highlightbackground=C["border"],
                            font=(MONO_FONT, 9), wrap="none", padx=8, pady=6,
@@ -684,7 +815,7 @@ class App:
 
         # ---- footer -----------------------------------------------------
         foot = tk.Frame(root, bg=C["bg"])
-        foot.grid(row=3, column=0, sticky="ew", padx=18, pady=16)
+        foot.grid(row=3, column=0, sticky="ew", padx=18, pady=12)
         foot.columnconfigure(0, weight=1)
 
         prog = tk.Frame(foot, bg=C["bg"])
@@ -707,15 +838,35 @@ class App:
         outer, b = card(parent, "1 - ORIGEN")
         b.columnconfigure(0, weight=1)
 
-        label(b, "Archivo de video").grid(row=0, column=0, columnspan=2, sticky="w")
+        self.lbl_input = label(b, "Archivo de video")
+        self.lbl_input.grid(row=0, column=0, sticky="w")
+        cb = ttk.Combobox(b, textvariable=self.v_mode, values=MODOS,
+                          state="readonly", style="R.TCombobox", width=9)
+        cb.grid(row=0, column=1, sticky="e", padx=(6, 0))
+        cb.bind("<<ComboboxSelected>>", lambda _e: self._sync_mode())
+
         ttk.Entry(b, textvariable=self.v_input, style="R.TEntry").grid(
             row=1, column=0, sticky="ew", pady=(3, 0))
         button(b, "Buscar", self._pick_input).grid(row=1, column=1, sticky="ew",
                                                    padx=(6, 0), pady=(3, 0))
+
+        self.frm_batch = tk.Frame(b, bg=C["panel"])
+        self.frm_batch.grid(row=2, column=0, columnspan=2, sticky="w", pady=(9, 0))
+        for i, (txt, var) in enumerate((
+                ("Incluir subcarpetas", self.v_recursive),
+                ("Ignorar archivos *_clip_*", self.v_skip_clips),
+                ("Omitir videos ya procesados", self.v_skip_done))):
+            ttk.Checkbutton(self.frm_batch, text=txt, variable=var,
+                            style="R.TCheckbutton",
+                            command=self._probe_later).grid(
+                row=0, column=i, sticky="w", padx=(0, 18))
+
         tk.Label(b, textvariable=self.v_probe, bg=C["panel"], fg=C["muted"],
                  font=(MONO_FONT, 8), anchor="w", justify="left", wraplength=840
-                 ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(9, 0))
+                 ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(9, 0))
         self.v_input.trace_add("write", lambda *_: self._probe_later())
+        # El estimado "N clips a generar" depende del número de clips.
+        self.v_clips.trace_add("write", lambda *_: self._probe_later())
         return outer
 
     def _card_cortes(self, parent):
@@ -723,15 +874,15 @@ class App:
         b.columnconfigure(0, weight=1)
         b.columnconfigure(1, weight=1)
 
-        label(b, "Numero de clips").grid(row=0, column=0, sticky="w")
-        label(b, "Duracion (seg)").grid(row=0, column=1, sticky="w", padx=(8, 0))
+        label(b, "Número de clips").grid(row=0, column=0, sticky="w")
+        label(b, "Duración (seg)").grid(row=0, column=1, sticky="w", padx=(8, 0))
         ttk.Spinbox(b, from_=1, to=9999, textvariable=self.v_clips,
                     style="R.TSpinbox").grid(row=1, column=0, sticky="ew", pady=(3, 0))
         ttk.Spinbox(b, from_=0.1, to=3600, increment=0.5, textvariable=self.v_dur,
                     style="R.TSpinbox").grid(row=1, column=1, sticky="ew",
                                              padx=(8, 0), pady=(3, 0))
 
-        label(b, "Distribucion").grid(row=2, column=0, columnspan=2, sticky="w",
+        label(b, "Distribución").grid(row=2, column=0, columnspan=2, sticky="w",
                                       pady=(12, 0))
         cb = ttk.Combobox(b, textvariable=self.v_dist, values=DISTRIBUCIONES,
                           state="readonly", style="R.TCombobox")
@@ -759,27 +910,40 @@ class App:
         outer, b = card(parent, "3 - SALIDA")
         b.columnconfigure(0, weight=1)
 
-        label(b, "Carpeta de salida").grid(row=0, column=0, columnspan=3, sticky="w")
-        ttk.Entry(b, textvariable=self.v_outdir, style="R.TEntry").grid(
-            row=1, column=0, sticky="ew", pady=(3, 0))
+        self.lbl_outdir = label(b, "Carpeta de salida")
+        self.lbl_outdir.grid(row=0, column=0, columnspan=3, sticky="w")
+        self.ent_outdir = ttk.Entry(b, textvariable=self.v_outdir, style="R.TEntry")
+        self.ent_outdir.grid(row=1, column=0, sticky="ew", pady=(3, 0))
         button(b, "Buscar", self._pick_outdir).grid(row=1, column=1, padx=(6, 0),
                                                     pady=(3, 0))
         button(b, "Abrir", self._open_outdir).grid(row=1, column=2, padx=(6, 0),
                                                    pady=(3, 0))
 
-        label(b, "Codec").grid(row=2, column=0, columnspan=3, sticky="w", pady=(12, 0))
+        label(b, "Organizar salida").grid(row=2, column=0, columnspan=3,
+                                          sticky="w", pady=(12, 0))
+        cbs = ttk.Combobox(b, textvariable=self.v_salida_modo, values=SALIDAS,
+                           state="readonly", style="R.TCombobox")
+        cbs.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(3, 0))
+        cbs.bind("<<ComboboxSelected>>", lambda _e: self._sync_salida())
+
+        self.lbl_salida = tk.Label(b, text="", bg=C["panel"], fg=C["muted"],
+                                   font=(UI_FONT, 8), anchor="w", justify="left",
+                                   wraplength=380)
+        self.lbl_salida.grid(row=4, column=0, columnspan=3, sticky="w", pady=(7, 0))
+
+        label(b, "Códec").grid(row=5, column=0, columnspan=3, sticky="w", pady=(12, 0))
         cb = ttk.Combobox(b, textvariable=self.v_codec, values=CODECS,
                           state="readonly", style="R.TCombobox")
-        cb.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(3, 0))
+        cb.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(3, 0))
         cb.bind("<<ComboboxSelected>>", lambda _e: self._sync_codec())
 
         self.lbl_codec = tk.Label(b, text="", bg=C["panel"], fg=C["muted"],
                                   font=(UI_FONT, 8), anchor="w", justify="left",
                                   wraplength=380)
-        self.lbl_codec.grid(row=4, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        self.lbl_codec.grid(row=7, column=0, columnspan=3, sticky="w", pady=(8, 0))
 
         ttk.Checkbutton(b, text="Incluir audio", variable=self.v_audio,
-                        style="R.TCheckbutton").grid(row=5, column=0, columnspan=3,
+                        style="R.TCheckbutton").grid(row=8, column=0, columnspan=3,
                                                      sticky="w", pady=(10, 0))
         return outer
 
@@ -794,7 +958,7 @@ class App:
         self.lbl_hapfmt.grid(row=0, column=0, sticky="w")
         self.lbl_chunks = label(b, "Chunks HAP")
         self.lbl_chunks.grid(row=0, column=1, sticky="w", padx=pad)
-        self.lbl_align = label(b, "Ajuste a multiplo de 4")
+        self.lbl_align = label(b, "Ajuste a múltiplo de 4")
         self.lbl_align.grid(row=0, column=2, sticky="w", padx=pad)
         label(b, "Procesos en paralelo").grid(row=0, column=3, sticky="w", padx=pad)
 
@@ -817,7 +981,7 @@ class App:
                                                    sticky="ew", pady=13)
 
         # -- fila 2: nombres, seed, ffmpeg -------------------------------------
-        label(b, "Seed (vacio = random)").grid(row=3, column=0, sticky="w")
+        label(b, "Seed (vacío = random)").grid(row=3, column=0, sticky="w")
         label(b, "Sufijo en el nombre").grid(row=3, column=1, sticky="w", padx=pad)
         label(b, "Carpeta bin de ffmpeg").grid(row=3, column=2, columnspan=2,
                                                sticky="w", padx=pad)
@@ -833,7 +997,34 @@ class App:
         button(ffrow, "...", self._pick_ffmpeg).grid(row=0, column=1, padx=(5, 0))
         return outer
 
-    # -- sincronizacion de UI ---------------------------------------------
+    # -- sincronización de UI ---------------------------------------------
+    def _is_batch(self) -> bool:
+        return self.v_mode.get() == "Carpeta"
+
+    def _sync_mode(self):
+        batch = self._is_batch()
+        self.lbl_input.configure(text="Carpeta con videos" if batch
+                                 else "Archivo de video")
+        if batch:
+            self.frm_batch.grid()
+        else:
+            self.frm_batch.grid_remove()
+        self.v_input.set("")
+        self.v_probe.set("sin carpeta" if batch else "sin archivo")
+        self._sync_salida()
+
+    def _sync_salida(self):
+        modo = self.v_salida_modo.get()
+        hints = {
+            "Subcarpeta por video": "Cada video a <salida>\\<nombre del video>\\",
+            "Todo en una carpeta": "Todos los clips sueltos en la carpeta de salida.",
+            "Junto al video de origen": "Al lado de cada video fuente.",
+        }
+        self.lbl_salida.configure(text=hints.get(modo, ""))
+        libre = modo == "Junto al video de origen"
+        self.ent_outdir.configure(state="disabled" if libre else "normal")
+        self.lbl_outdir.configure(fg=C["border"] if libre else C["muted"])
+
     def _sync_dist(self):
         mode = self.v_dist.get()
         if mode == "Estratificado":
@@ -852,18 +1043,14 @@ class App:
     def _sync_codec(self):
         codec = self.v_codec.get()
         hints = {
-            "hap": "HAP -> .mov. Decodifica en GPU, ideal para moviefilein en TD. "
-                   "hap_q = mejor calidad (mas peso), hap_alpha = con canal alpha.",
-            "prores_ks": "ProRes HQ (profile 3, qscale 10) -> .mov. Decodifica en CPU.",
-            "libx264": "H.264 crf 18, yuv420p -> .mp4. Liviano en disco, pero paga "
-                       "spike de CPU cada vez que TD abre el archivo.",
-            "h264_nvenc": "H.264 por GPU (NVENC) -> .mp4. El mas rapido de exportar; "
-                          "igual decodifica en CPU dentro de TD.",
-            "copy": "Sin recomprimir: copia el stream y mantiene la extension del "
-                    "origen. Solo corta en keyframes.",
+            "hap": "HAP (.mov): decodifica en GPU, lo ideal para TouchDesigner.",
+            "prores_ks": "ProRes HQ (.mov). Decodifica en CPU.",
+            "libx264": "H.264 CRF 18 (.mp4). Liviano, pero decodifica en CPU.",
+            "h264_nvenc": "H.264 por NVENC (.mp4). El más rápido de exportar.",
+            "copy": "Sin recomprimir, misma extensión. Corta solo en keyframes.",
         }
         self.lbl_codec.configure(text=hints.get(codec, ""))
-        # Las opciones HAP se apagan en vez de esconderse: el layout no salta.
+        # Las opciones HAP se desactivan en vez de ocultarse: el layout no salta.
         is_hap = codec == "hap"
         for w in (self.w_hapfmt, self.w_align):
             w.configure(state="readonly" if is_hap else "disabled")
@@ -881,9 +1068,17 @@ class App:
 
     # -- acciones ----------------------------------------------------------
     def _pick_input(self):
-        path = filedialog.askopenfilename(
-            title="Video de origen", filetypes=VIDEO_TYPES,
-            initialdir=self.cfg.get("input_dir") or None)
+        start = self.cfg.get("input_dir") or None
+        if self._is_batch():
+            path = filedialog.askdirectory(title="Carpeta con videos",
+                                           initialdir=self.v_input.get() or start)
+            if path:
+                self.v_input.set(path)
+                self.cfg["input_dir"] = path
+            return
+        path = filedialog.askopenfilename(title="Video de origen",
+                                          filetypes=VIDEO_TYPES,
+                                          initialdir=start)
         if path:
             self.v_input.set(path)
             self.cfg["input_dir"] = str(Path(path).parent)
@@ -902,7 +1097,7 @@ class App:
             self.ffprobe = find_tool("ffprobe", path)
             self._refresh_tools_label()
             self._log(f"ffmpeg: {self.ffmpeg}" if self.ffmpeg
-                      else "Ahi no hay ffmpeg.exe / ffprobe.exe",
+                      else "Ahí no hay ffmpeg.exe / ffprobe.exe",
                       "ok" if self.ffmpeg else "err")
             self._probe_later()
 
@@ -926,6 +1121,32 @@ class App:
     def _probe_input(self):
         self._probe_job = None
         path = self.v_input.get().strip().strip('"')
+
+        if self._is_batch():
+            if not path or not os.path.isdir(path):
+                self.v_probe.set("sin carpeta")
+                return
+            srcs = collect_sources(path, self.v_recursive.get(),
+                                   self.v_skip_clips.get())
+            if not srcs:
+                self.v_probe.set("ningún video usable en esa carpeta")
+                return
+            try:
+                n = int(float(self.v_clips.get()))
+            except ValueError:
+                n = 0
+            total = sum(p.stat().st_size for p in srcs)
+            peso = (f"{total / (1 << 30):.1f} GB" if total >= (1 << 30)
+                    else f"{total / (1 << 20):.0f} MB")
+            muestra = ", ".join(p.stem for p in srcs[:3])
+            if len(srcs) > 3:
+                muestra += f", +{len(srcs) - 3} más"
+            self.v_probe.set(
+                f"{len(srcs)} videos  ·  {peso}"
+                + (f"  ·  {len(srcs) * n} clips a generar" if n else "")
+                + f"\n{muestra}")
+            return
+
         if not path or not os.path.isfile(path):
             self.v_probe.set("sin archivo")
             return
@@ -937,39 +1158,57 @@ class App:
         except (RuntimeError, ValueError, OSError) as exc:
             self.v_probe.set(f"no se pudo leer: {exc}")
             return
-        warn = "   [!] no es multiplo de 4" if (info["width"] % 4 or
+        warn = "   [!] no es múltiplo de 4" if (info["width"] % 4 or
                                                 info["height"] % 4) else ""
         self.v_probe.set(
             f"{info['codec']}  {info['width']}x{info['height']}{warn}\n"
             f"{fmt_dur(info['duration'])}  ·  {info['fps']:.3f} fps  ·  "
-            f"audio: {'si' if info['has_audio'] else 'no'}")
+            f"audio: {'sí' if info['has_audio'] else 'no'}")
 
     def _collect(self) -> dict | None:
         if not self.ffmpeg or not self.ffprobe:
             messagebox.showerror(
                 APP_NAME,
-                "No encontre ffmpeg / ffprobe.\n\nInstalalos "
+                "No encontré ffmpeg / ffprobe.\n\nInstálalos "
                 "(winget install Gyan.FFmpeg) o indica la carpeta bin en AVANZADO.")
             return None
 
+        batch = self._is_batch()
         src = self.v_input.get().strip().strip('"')
-        if not os.path.isfile(src):
-            messagebox.showerror(APP_NAME, "Elegi un archivo de video valido.")
+        if batch:
+            if not os.path.isdir(src):
+                messagebox.showerror(APP_NAME, "Elige una carpeta válida.")
+                return None
+            if not collect_sources(src, self.v_recursive.get(),
+                                   self.v_skip_clips.get()):
+                messagebox.showerror(
+                    APP_NAME,
+                    "No hay videos usables en esa carpeta.\n\nSi los archivos "
+                    "tienen '_clip_' en el nombre, desmarca la opción que los "
+                    "ignora, o activa 'Incluir subcarpetas'.")
+                return None
+        elif not os.path.isfile(src):
+            messagebox.showerror(APP_NAME, "Elige un archivo de video válido.")
             return None
 
+        salida_modo = self.v_salida_modo.get()
         outdir = self.v_outdir.get().strip().strip('"')
-        if not outdir:
-            messagebox.showerror(APP_NAME, "Elegi una carpeta de salida.")
-            return None
-        if not os.path.isdir(outdir):
-            if not messagebox.askyesno(
-                    APP_NAME, f"La carpeta no existe:\n{outdir}\n\nLa creo?"):
+        if salida_modo == "Junto al video de origen":
+            outdir = src if batch else str(Path(src).parent)
+        else:
+            if not outdir:
+                messagebox.showerror(APP_NAME, "Elige una carpeta de salida.")
                 return None
-            try:
-                Path(outdir).mkdir(parents=True, exist_ok=True)
-            except OSError as exc:
-                messagebox.showerror(APP_NAME, f"No pude crear la carpeta:\n{exc}")
-                return None
+            if not os.path.isdir(outdir):
+                if not messagebox.askyesno(
+                        APP_NAME, f"La carpeta no existe:\n{outdir}\n\n¿La creo?"):
+                    return None
+                try:
+                    Path(outdir).mkdir(parents=True, exist_ok=True)
+                except OSError as exc:
+                    messagebox.showerror(APP_NAME,
+                                         f"No pude crear la carpeta:\n{exc}")
+                    return None
 
         try:
             clips = int(float(self.v_clips.get()))
@@ -979,10 +1218,10 @@ class App:
         except ValueError:
             messagebox.showerror(
                 APP_NAME,
-                "Numero de clips, duracion, procesos y chunks tienen que ser numeros.")
+                "Número de clips, duración, procesos y chunks tienen que ser números.")
             return None
         if clips < 1 or duration <= 0:
-            messagebox.showerror(APP_NAME, "Numero de clips >= 1 y duracion > 0.")
+            messagebox.showerror(APP_NAME, "Número de clips >= 1 y duración > 0.")
             return None
 
         seed_raw = self.v_seed.get().strip()
@@ -1000,6 +1239,11 @@ class App:
         return {
             "ffmpeg": self.ffmpeg, "ffprobe": self.ffprobe,
             "input": src, "outdir": outdir,
+            "batch": batch,
+            "recursive": bool(self.v_recursive.get()),
+            "skip_clips": bool(self.v_skip_clips.get()),
+            "skip_done": bool(self.v_skip_done.get()),
+            "salida_modo": salida_modo,
             "clips": clips, "duration": duration,
             "codec": self.v_codec.get(), "audio": bool(self.v_audio.get()),
             "distribucion": self.v_dist.get(), "spread": float(self.v_spread.get()),
@@ -1037,19 +1281,24 @@ class App:
         self.renderer = None
         self.btn_go.configure(state="normal", bg=C["accent"])
         self.btn_cancel.configure(state="disabled")
-        ok, fail = res.get("ok", 0), res.get("fail", 0)
+        ok = res.get("ok", 0)
+        fail = res.get("fail", 0)
+        skipped = res.get("skipped", 0)
         if res.get("aborted") and not ok and not fail:
             self.v_status.set("cancelado")
             return
+        extra = ([f"{fail} con error"] if fail else []) + \
+                ([f"{skipped} omitidos"] if skipped else [])
         self.v_status.set(f"{ok} clips exportados"
-                          + (f"  -  {fail} con error" if fail else ""))
+                          + ("  -  " + "  -  ".join(extra) if extra else ""))
+        cola = ("\n" + ", ".join(extra)) if extra else ""
         if fail:
             messagebox.showwarning(
-                APP_NAME, f"{ok} clips exportados, {fail} fallaron.\n"
+                APP_NAME, f"{ok} clips exportados.{cola}\n\n"
                           "Mira la consola para el detalle de ffmpeg.")
-        elif ok:
-            messagebox.showinfo(APP_NAME,
-                                f"{ok} clips exportados en:\n{res.get('outdir', '')}")
+        elif ok or skipped:
+            messagebox.showinfo(
+                APP_NAME, f"{ok} clips exportados en:\n{res.get('outdir', '')}{cola}")
 
     # -- cola / log --------------------------------------------------------
     def _tick(self):
@@ -1087,12 +1336,17 @@ class App:
     # -- cierre ------------------------------------------------------------
     def _on_close(self):
         if self.running and not messagebox.askyesno(
-                APP_NAME, "Hay una exportacion en curso. Salir igual?"):
+                APP_NAME, "Hay una exportación en curso. ¿Salir igual?"):
             return
         if self.renderer:
             self.renderer.abort()
         self.cfg.update({
             "ffmpeg_dir": self.ffmpeg_dir.get(),
+            "mode": self.v_mode.get(),
+            "recursive": bool(self.v_recursive.get()),
+            "skip_clips": bool(self.v_skip_clips.get()),
+            "skip_done": bool(self.v_skip_done.get()),
+            "salida_modo": self.v_salida_modo.get(),
             "outdir": self.v_outdir.get(),
             "clips": self.v_clips.get(),
             "duration": self.v_dur.get(),
