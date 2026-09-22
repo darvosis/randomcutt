@@ -6,12 +6,14 @@ randomcutt - extractor de clips random para VJ / TouchDesigner
 Saca N clips de duración fija desde un video largo y los exporta en HAP
 (u otro códec) para alimentar videocutter / moviefilein en TouchDesigner.
 
-v0.8.0 - GUI, modo carpeta (lote) y detección automática de ffmpeg.
+v0.9.0 - nombres limpios para los clips (quita año, resolución, códec, grupo...)
+         y descarga de ffmpeg desde la app si no está instalado.
 Un solo archivo, sin dependencias externas (solo stdlib + ffmpeg/ffprobe).
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import queue
@@ -23,12 +25,15 @@ import sys
 import threading
 import time
 import tkinter as tk
+import unicodedata
+import urllib.request
+import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 APP_NAME = "randomcutt"
-APP_VERSION = "0.8.0"
+APP_VERSION = "0.9.0"
 
 VIDEO_TYPES = [
     ("Video", "*.mp4 *.mov *.mkv *.avi *.m4v *.webm *.mpg *.mpeg *.ts *.wmv *.flv"),
@@ -72,6 +77,7 @@ DISTRIBUCIONES = ["Random puro", "Estratificado", "Lineal"]
 
 MODOS = ["Archivo", "Carpeta"]
 SALIDAS = ["Subcarpeta por video", "Todo en una carpeta", "Junto al video de origen"]
+NOMBRES = ["Limpio", "Limpio sin espacios", "snake_case", "Original"]
 
 VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".avi", ".m4v", ".webm",
               ".mpg", ".mpeg", ".ts", ".wmv", ".flv"}
@@ -142,6 +148,12 @@ def find_tool(name: str, override_dir: str | None = None) -> str | None:
                     cands += sorted(lap.glob(pat), reverse=True)
                 except OSError:
                     pass
+    elif sys.platform == "darwin":
+        # Abierta desde el Finder, la app no hereda el PATH de la terminal.
+        cands += [Path("/opt/homebrew/bin") / exe, Path("/usr/local/bin") / exe]
+
+    # Último recurso: la copia que descarga la propia app.
+    cands.append(managed_ffmpeg_dir() / "bin" / exe)
 
     for c in cands:
         try:
@@ -209,6 +221,180 @@ def fmt_dur(seconds: float) -> str:
 
 
 # --------------------------------------------------------------------------
+# Descarga de ffmpeg (Windows)
+# --------------------------------------------------------------------------
+# Build "full" de gyan.dev: el "essentials" no trae libsnappy y sin eso ffmpeg
+# no tiene encoder HAP. La variante "shared" pesa ~95 MB, la estática ~250 MB.
+FFMPEG_RELEASE_API = "https://api.github.com/repos/GyanD/codexffmpeg/releases/latest"
+FFMPEG_ASSET_RE = re.compile(r"full_build-shared\.zip$", re.IGNORECASE)
+# Respaldo con URL fija (también trae snappy) por si la API de GitHub falla
+# o se agotó el límite de consultas sin cuenta.
+FFMPEG_FALLBACK = ("ffmpeg-master-latest-win64-gpl-shared.zip",
+                   "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/"
+                   "ffmpeg-master-latest-win64-gpl-shared.zip")
+HTTP_HEADERS = {"User-Agent": f"{APP_NAME}/{APP_VERSION}"}
+
+
+def managed_ffmpeg_dir() -> Path:
+    """Dónde deja ffmpeg la descarga: junto al config, siempre escribible y
+    sin tocar el PATH ni el resto del sistema."""
+    return config_file().parent / "ffmpeg"
+
+
+def has_hap_encoder(ffmpeg: str) -> bool:
+    try:
+        res = subprocess.run([ffmpeg, "-hide_banner", "-encoders"],
+                             capture_output=True, text=True, errors="replace",
+                             stdin=subprocess.DEVNULL, timeout=30,
+                             **_no_window_kwargs())
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return bool(re.search(r"^\s*V\S*\s+hap\s", res.stdout, re.MULTILINE))
+
+
+class DownloadCancelled(Exception):
+    pass
+
+
+class FFmpegDownloader:
+    """Descarga e instala ffmpeg + ffprobe en un hilo; reporta por la cola."""
+
+    def __init__(self, ui_queue: queue.Queue):
+        self.q = ui_queue
+        self.cancel = threading.Event()
+
+    def log(self, msg: str, tag: str = "info"):
+        self.q.put(("log", msg, tag))
+
+    def run(self):
+        try:
+            final = self._run()
+            self.q.put(("dl_done", {"ok": True, "dir": str(final)}))
+        except DownloadCancelled:
+            self.q.put(("dl_done", {"ok": False, "cancelled": True}))
+        except Exception as exc:                                  # noqa: BLE001
+            self.q.put(("dl_done", {"ok": False, "error": str(exc)}))
+
+    def _run(self) -> Path:
+        dest = managed_ffmpeg_dir()
+        dest.mkdir(parents=True, exist_ok=True)
+
+        sources = []
+        try:
+            sources.append(self._latest_release())
+        except (OSError, ValueError, KeyError, StopIteration) as exc:
+            self.log(f"No pude consultar la última versión en GitHub ({exc}). "
+                     "Uso el respaldo.", "warn")
+        sources.append((*FFMPEG_FALLBACK, 0, ""))
+
+        errors = []
+        for i, (name, url, size, digest) in enumerate(sources):
+            last = i == len(sources) - 1
+            try:
+                return self._install(name, url, size, digest, dest, require_hap=not last)
+            except DownloadCancelled:
+                raise
+            except (OSError, ValueError, RuntimeError, zipfile.BadZipFile) as exc:
+                errors.append(f"{name}: {exc}")
+                self.log(f"  FALLO {name}: {exc}", "err")
+        raise RuntimeError(" | ".join(errors))
+
+    def _latest_release(self) -> tuple[str, str, int, str]:
+        req = urllib.request.Request(FFMPEG_RELEASE_API, headers=HTTP_HEADERS)
+        with urllib.request.urlopen(req, timeout=20) as r:
+            data = json.loads(r.read().decode("utf-8"))
+        asset = next(a for a in data["assets"] if FFMPEG_ASSET_RE.search(a["name"]))
+        return (asset["name"], asset["browser_download_url"],
+                int(asset.get("size") or 0), asset.get("digest") or "")
+
+    def _install(self, name: str, url: str, size: int, digest: str, dest: Path,
+                 require_hap: bool) -> Path:
+        part = dest / "descarga.zip.part"
+        tmp = dest / "bin.new"
+        try:
+            self.log(f"Descargando {name} ...")
+            sha = self._download(url, size, part)
+            if digest.startswith("sha256:") and sha != digest[7:].lower():
+                raise RuntimeError("el checksum no coincide: descarga corrupta")
+            if digest.startswith("sha256:"):
+                self.log("  checksum sha256 verificado", "muted")
+
+            # Solo bin\: ffmpeg, ffprobe y sus DLL. ffplay no hace falta.
+            self.log("  descomprimiendo ...", "muted")
+            shutil.rmtree(tmp, ignore_errors=True)
+            tmp.mkdir()
+            with zipfile.ZipFile(part) as z:
+                for m in z.infolist():
+                    parts = m.filename.replace("\\", "/").split("/")
+                    fname = parts[-1]
+                    if m.is_dir() or "bin" not in parts[:-1] or not fname:
+                        continue
+                    if fname.lower().startswith("ffplay"):
+                        continue
+                    if self.cancel.is_set():
+                        raise DownloadCancelled
+                    # Solo el nombre del archivo: una ruta del zip nunca
+                    # puede escribir fuera de la carpeta (zip slip).
+                    with z.open(m) as src, open(tmp / fname, "wb") as out:
+                        shutil.copyfileobj(src, out)
+
+            exe = ".exe" if IS_WIN else ""
+            ffm, ffp = tmp / f"ffmpeg{exe}", tmp / f"ffprobe{exe}"
+            if not (ffm.is_file() and ffp.is_file()):
+                raise RuntimeError("el zip no trae ffmpeg y ffprobe")
+            res = subprocess.run([str(ffp), "-hide_banner", "-version"],
+                                 capture_output=True, stdin=subprocess.DEVNULL,
+                                 timeout=30, **_no_window_kwargs())
+            if res.returncode != 0:
+                raise RuntimeError("el ffprobe descargado no arranca")
+            hap = has_hap_encoder(str(ffm))
+            if not hap and require_hap:
+                raise RuntimeError("este build no trae el encoder HAP")
+
+            # Reemplazo casi atómico: la copia anterior se borra al final.
+            final, old = dest / "bin", dest / "bin.old"
+            shutil.rmtree(old, ignore_errors=True)
+            if final.exists():
+                final.rename(old)
+            tmp.rename(final)
+            shutil.rmtree(old, ignore_errors=True)
+            if not hap:
+                self.log("  AVISO: este ffmpeg no trae HAP; usa otro códec o "
+                         "instala el build full de gyan.dev.", "warn")
+            return final
+        finally:
+            try:
+                part.unlink(missing_ok=True)
+            except OSError:
+                pass
+            shutil.rmtree(tmp, ignore_errors=True)       # ya renombrado si salió bien
+
+    def _download(self, url: str, size: int, out: Path) -> str:
+        req = urllib.request.Request(url, headers=HTTP_HEADERS)
+        sha = hashlib.sha256()
+        with urllib.request.urlopen(req, timeout=30) as r, open(out, "wb") as f:
+            total = int(r.headers.get("Content-Length") or size or 0)
+            done, last = 0, 0.0
+            while True:
+                if self.cancel.is_set():
+                    raise DownloadCancelled
+                chunk = r.read(1 << 16)
+                if not chunk:
+                    break
+                f.write(chunk)
+                sha.update(chunk)
+                done += len(chunk)
+                now = time.time()
+                if now - last > 0.15:
+                    self.q.put(("dl_progress", {"done": done, "total": total}))
+                    last = now
+        self.q.put(("dl_progress", {"done": done, "total": total}))
+        if total and done != total:
+            raise RuntimeError(f"descarga incompleta ({done} de {total} bytes)")
+        return sha.hexdigest()
+
+
+# --------------------------------------------------------------------------
 # Lógica de corte
 # --------------------------------------------------------------------------
 
@@ -260,13 +446,317 @@ def collect_sources(folder: str, recursive: bool, skip_clips: bool) -> list[Path
     return sorted(out, key=lambda q: str(q).lower())
 
 
-def output_dir_for(src: Path, cfg: dict) -> Path:
+# --------------------------------------------------------------------------
+# Nombres limpios
+# --------------------------------------------------------------------------
+# Los nombres de release siguen una convención de facto (scene, P2P, fansubs):
+#   Titulo.Del.Video.1998.1080p.BluRay.x264.AAC5.1-GRUPO
+#   [Fansub] Titulo - 05 [1080p][ABCD1234]
+#   Serie.S02E03.Titulo.Del.Episodio.720p.WEB-DL
+# El título va primero; desde el año, la primera etiqueta técnica o el
+# marcador de episodio, todo lo que sigue es metadata. No hay listas de
+# películas: solo vocabulario técnico, así que sirve para cualquier nombre.
+
+# Etiquetas técnicas que nunca forman parte de un título. Desde la primera
+# que aparece (salvo en la primera palabra), el resto se descarta. Quedan
+# fuera palabras que sí aparecen en títulos ("web": Charlotte's Web).
+_JUNK_WORDS = frozenset("""
+    bluray blu-ray bdrip brrip bdremux remux bd bd25 bd50 bdmv hddvd
+    dvdrip dvd dvdr dvd-r dvd5 dvd9 dvdscr dvdscreener ntsc pal
+    webrip web-dl webdl webcap hdtv pdtv sdtv hdrip tvrip satrip dsr dsrip
+    vhsrip vhs ldrip laserdisc hdcam camrip telesync telecine ppv
+    amzn nf dsnp hmax atvp hulu itunes
+    x264 x265 h264 h265 hevc avc xvid divx av1 vp9 mpeg2 mpeg4
+    hi10 hi10p hdr hdr10 hdr10+ dovi sdr uhd fhd qhd 4k 8k
+    aac ac3 eac3 e-ac3 ddp dts dts-hd dtshd dts-x dtsx truehd atmos flac mp3
+    opus lpcm pcm
+    yts yify rarbg ettv eztv
+""".split())
+
+_JUNK_RE = re.compile(r"""(?x)^(?:
+      \d{3,4}[pi]                                     # 1080p, 576i
+    | \d{3,4}x\d{3,4}p?                               # 1920x1080
+    | (?:aac|ac3|eac3|ddp?|dts|flac|truehd|opus|lpcm|mp3)[\d.x+]+   # AAC5.1, FLACx2
+    | \d\.\d(?:x\d)?                                  # 5.1, 2.0
+    | \d{1,2}ch                                       # 6ch
+    | \d{1,2}bits?                                    # 10bit
+    | [hx]\.?26[45]                                   # h.264, x265
+)$""")
+
+# Ediciones, idiomas y tags de release: son palabras comunes, así que solo se
+# quitan cuando quedan al final del título ("Uncut Gems" se salva).
+_TAIL_WORDS = frozenset("""
+    remastered remaster restored restoration repack proper rerip
+    extended unrated uncut uncensored theatrical imax hybrid upscale upscaled
+    dubbed subbed dual audio multi multisub subs sub subtitled subtitulado
+    vose vostfr eng esp spa jap jpn ita fre fra ger lat latino castellano
+    english spanish japanese french german italian
+    bfi criterion limited internal readnfo dc
+""".split())
+_CUT_PREV = frozenset({"directors", "extended", "theatrical", "uncut"})
+_EDITION_PREV = frozenset({"special", "anniversary", "collectors", "limited",
+                           "ultimate", "deluxe", "definitive", "criterion",
+                           "extended", "remastered", "restored"})
+
+# Episodios compactos: cortan el título (lo que sigue es el nombre del
+# episodio) y se conservan al final: S02E03, S01, 1x05, E05, EP05.
+_EP_RE = re.compile(r"^(?:s\d{1,2}(?:e\d{1,3}){0,2}|\d{1,2}x\d{2,3}|ep?\d{1,3}(?:v\d)?)$",
+                    re.IGNORECASE)
+# Partes/volúmenes/discos: no cortan (pueden ser parte del título, como en
+# "Kill Bill Vol 1"), pero si aparecen después del corte se recuperan, para
+# que "Parte 1" y "Parte 2" no terminen con el mismo nombre.
+_PART_WORDS = frozenset({"part", "pt", "parte", "cd", "disc", "disk", "disco",
+                         "vol", "volume", "volumen", "chapter", "capitulo",
+                         "cap", "episode", "episodio", "ep"})
+_PART_NUM_RE = re.compile(r"^(?:\d{1,3}|[ivx]{1,5})$", re.IGNORECASE)
+_PART_JOINED_RE = re.compile(r"^(cd|disc|disk|pt|part|vol)(\d{1,2})$", re.IGNORECASE)
+
+_ANIME_EP_RE = re.compile(r"^\d{1,3}(?:v\d)?$")        # "Titulo - 05" / "- 05v2"
+_MAX_YEAR = time.localtime().tm_year + 1                # 2049 no es un año de estreno
+_DOT = ""                                         # punto protegido (5.1, L.A.)
+_WIN_RESERVED = frozenset({"con", "prn", "aux", "nul",
+                           *(f"com{i}" for i in range(1, 10)),
+                           *(f"lpt{i}" for i in range(1, 10))})
+MAX_NAME_LEN = 80
+
+
+def _key(tok: str) -> str:
+    """Forma normalizada para comparar: minúsculas, sin apóstrofes ni puntuación."""
+    return re.sub(r"['’`]", "", tok.lower()).strip(".,;:!?")
+
+
+def _is_year(tok: str) -> bool:
+    return len(tok) == 4 and tok.isdigit() and 1888 <= int(tok) <= _MAX_YEAR
+
+
+def _is_junk(tok: str) -> bool:
+    k = _key(tok)
+    if k in _JUNK_WORDS or _JUNK_RE.match(k):
+        return True
+    head = re.split(r"[-+]", k, maxsplit=1)[0]          # x264-GRUPO, AAC-GRUPO
+    return head != k and (head in _JUNK_WORDS or bool(_JUNK_RE.match(head)))
+
+
+def _is_tail(tok: str) -> bool:
+    return any(p in _TAIL_WORDS for p in re.split(r"[+/]", _key(tok)) if p)
+
+
+def _fmt_ep(tok: str) -> str:
+    return tok.upper() if tok[:1].isalpha() else tok.lower()    # S02E03, 1x05
+
+
+def _part_label(key: str) -> str:
+    return "CD" if key == "cd" else key.capitalize()
+
+
+def _split_chunk(chunk: str, group: int, out: list):
+    """Parte un tramo de texto en tokens; los guiones sueltos quedan como '-'."""
+    for raw in re.sub(r"[()]", " ", chunk).split():
+        raw = raw.replace(_DOT, ".")
+        core = raw.strip("-")
+        if raw.startswith("-"):
+            out.append(("-", group))
+        if core:
+            out.append((core, group))
+        if raw.endswith("-") and core:
+            out.append(("-", group))
+
+
+def _tokenize(stem: str, drop_brackets: bool) -> list[tuple[str, int]]:
+    """Tokens del nombre como (texto, grupo). grupo > 0 = dentro de (...)."""
+    # NFKC: unifica acentos descompuestos (macOS) y paréntesis de ancho completo.
+    s = unicodedata.normalize("NFKC", stem)
+    s = re.sub(r"(?i)\bwww\.[^\s\[\](){}]+", " ", s)
+    s = re.sub(r"(?i)^\s*[\w-]+\.(?:com|net|org|to|tv|mx|am|ag|lt|se|cc|io|me|in|info)"
+               r"\s+-\s+", " ", s)                      # "sitio.com - Titulo"
+    if drop_brackets:
+        s = re.sub(r"\[[^\]]*\]|\{[^}]*\}|【[^】]*】|〔[^〕]*〕", " ", s)
+    s = re.sub(r"[\[\]{}【】〔〕]", " ", s)
+    s = re.sub(r"(?i)(?<![a-z0-9])([hx])\.(26[45])(?!\d)", r"\1\2", s)   # H.264
+    s = re.sub(r"(?<!\d)(\d)\.(\d)(?!\d)", rf"\1{_DOT}\2", s)   # 5.1 queda entero
+    s = re.sub(r"(?<![^\W\d_])((?:[^\W\d_]\.){2,})",             # L.A. / S.W.A.T.
+               lambda m: m.group(1).replace(".", _DOT) + " ", s)
+    s = re.sub(r"[._~]", " ", s)
+    s = re.sub(r"\s*[–—]\s*", " - ", s)
+
+    toks: list[tuple[str, int]] = []
+    pos = group = 0
+    for m in re.finditer(r"\(([^()]*)\)", s):
+        _split_chunk(s[pos:m.start()], 0, toks)
+        group += 1
+        _split_chunk(m.group(1), group, toks)
+        pos = m.end()
+    _split_chunk(s[pos:], 0, toks)
+    return toks
+
+
+def _parse(stem: str, drop_brackets: bool = True) -> tuple[list[str], str, str]:
+    """Separa (palabras del título, marcador de episodio/parte, año)."""
+    toks = _tokenize(stem, drop_brackets)
+    words = [t for t, _ in toks]
+    n = len(words)
+    first = next((i for i, t in enumerate(words) if t != "-"), n)
+
+    # 1. Primera etiqueta técnica o episodio compacto: ahí termina el título.
+    stop, ep_at = n, None
+    for i in range(first + 1, n):
+        t = words[i]
+        if t == "-":
+            if i + 1 < n and _ANIME_EP_RE.match(words[i + 1]):
+                stop, ep_at = i, i + 1
+                break
+            continue
+        if _EP_RE.match(t):
+            stop, ep_at = i, i
+            break
+        if _is_junk(t):
+            stop = i
+            break
+
+    # 2. Un paréntesis con metadata adentro también corta: "(1998)", "(Dual Audio)".
+    for i in range(first + 1, stop):
+        g = toks[i][1]
+        if g and (i == 0 or toks[i - 1][1] != g):
+            inner = [t for t, gg in toks if gg == g]
+            if any(_is_year(t) or _is_junk(t) or _is_tail(t) or _EP_RE.match(t)
+                   for t in inner):
+                stop, ep_at = i, None
+                break
+
+    # 3. El año es el último candidato antes del corte: "Wonder Woman 1984 2020".
+    year, cut = "", stop
+    for i in range(first + 1, stop):
+        if _is_year(words[i]):
+            year, cut = words[i], i
+    if not year:
+        year = next((t for t in words[stop:] if _is_year(t)), "")
+
+    # 4. Marcador: episodio compacto, o parte/volumen que quedó después del corte.
+    marker = _fmt_ep(words[ep_at]) if ep_at is not None else ""
+    if not marker:
+        for i in range(cut, n):
+            k = _key(words[i])
+            m = _PART_JOINED_RE.match(k)
+            if m:
+                marker = f"{_part_label(m.group(1))} {m.group(2)}"
+                break
+            if k in _PART_WORDS and i + 1 < n and _PART_NUM_RE.match(words[i + 1]):
+                marker = f"{_part_label(k)} {words[i + 1].upper()}"
+                break
+            if _EP_RE.match(words[i]):
+                marker = _fmt_ep(words[i])
+                break
+
+    # 5. Quitar ediciones y tags sueltos que quedaron al final del título.
+    title = words[first:cut]
+    while title:
+        k = _key(title[-1])
+        if title[-1] == "-" or _is_tail(title[-1]):
+            title.pop()
+        elif k == "cut" and len(title) > 1 and _key(title[-2]) in _CUT_PREV:
+            del title[-2:]
+        elif k == "edition":
+            title.pop()
+            while title and (_key(title[-1]) in _EDITION_PREV
+                             or re.fullmatch(r"\d+(?:st|nd|rd|th)", _key(title[-1]))):
+                title.pop()
+        elif k == "collection" and len(title) > 1 and _key(title[-2]) == "criterion":
+            del title[-2:]
+        else:
+            break
+    return title, marker, year
+
+
+def _cap(word: str) -> str:
+    """Mayúscula inicial también después de guion: spider-man -> Spider-Man."""
+    if re.fullmatch(r"(?:[^\W\d_]\.)+", word):
+        return word.upper()                             # l.a. -> L.A.
+    return re.sub(r"(^|-)([^\W\d_])", lambda m: m.group(1) + m.group(2).upper(), word)
+
+
+def _render(words: list[str], marker: str, year: str,
+            style: str, keep_year: bool) -> str:
+    # Solo se tocan mayúsculas si el nombre venía entero en minúsculas: un
+    # "MADOX" o "NorthStar" es intencional y se respeta.
+    letters = [c for w in words for c in w if c.isalpha()]
+    if letters and not any(c.isupper() for c in letters):
+        words = [_cap(w) for w in words]
+    parts = words + ([marker] if marker else [])
+
+    if style == "Limpio":
+        s = re.sub(r"(?:\s+-)+\s+", " - ", " ".join(parts))
+        return s + (f" ({year})" if keep_year and year else "")
+
+    flat = [x for p in parts
+            for x in re.split(r"\W+", re.sub(r"['’`.]", "", p)) if x]
+    if keep_year and year:
+        flat.append(year)
+    if style == "snake_case":
+        return "_".join(x.lower() for x in flat)
+    return "".join(x[:1].upper() + x[1:] for x in flat)
+
+
+def sanitize_name(name: str) -> str:
+    """Deja el nombre válido como archivo y carpeta en Windows, macOS y Linux."""
+    s = unicodedata.normalize("NFC", name or "")
+    s = re.sub(r'[<>:"/\\|?*\x00-\x1f]', " ", s)
+    s = re.sub(r"\s+", " ", s).strip(" .-_")
+    if len(s) > MAX_NAME_LEN:                           # la ruta de Windows tiene tope
+        s = s[:MAX_NAME_LEN]
+        sp = s.rfind(" ")
+        s = (s[:sp] if sp > MAX_NAME_LEN // 2 else s).rstrip(" .-_")
+    if s.split(".")[0].lower() in _WIN_RESERVED:        # CON, NUL, COM1...
+        s += "_"
+    return s
+
+
+def clip_base_name(stem: str, style: str, keep_year: bool = False) -> str:
+    """Nombre base de los clips a partir del nombre del video de origen."""
+    if style not in NOMBRES or style == "Original":
+        return stem
+    # Primero sin corchetes (grupos, hashes, sitios). Si el título queda vacío
+    # o es solo un año ("[REC] (2007)"), se reintenta conservándolos.
+    for drop in (True, False):
+        words, marker, year = _parse(stem, drop)
+        if words and not (len(words) == 1 and (_is_year(words[0]) or _is_junk(words[0]))):
+            break
+    name = sanitize_name(_render(words, marker, year, style, keep_year)) if words else ""
+    return name or sanitize_name(stem) or "video"
+
+
+def resolve_names(sources: list[Path], style: str, keep_year: bool,
+                  overrides: dict) -> list[tuple[str, str]]:
+    """Nombre final de cada video del lote: (nombre, nota).
+
+    Un nombre puesto a mano gana sobre el automático. Si dos videos terminan
+    con el mismo nombre, el segundo recibe "(2)": si no, se pisarían en la
+    misma subcarpeta y 'Omitir ya procesados' daría el segundo por hecho.
+    """
+    out, seen = [], set()
+    for src in sources:
+        manual = sanitize_name(overrides.get(src.name, ""))
+        base = manual or clip_base_name(src.stem, style, keep_year)
+        name, k = base, 2
+        while name.lower() in seen:
+            name = f"{base} ({k})" if style == "Limpio" else f"{base}_{k}"
+            k += 1
+        seen.add(name.lower())
+        out.append((name, "manual" if manual else ("repetido" if name != base else "")))
+    return out
+
+
+def norm_suffix(raw: str) -> str:
+    sfx = (raw or "").strip()
+    return "_" + sfx if sfx and not sfx.startswith(("_", "-", ".")) else sfx
+
+
+def output_dir_for(src: Path, name: str, cfg: dict) -> Path:
     """Dónde caen los clips de este video, según cómo se quiera organizar."""
     modo = cfg["salida_modo"]
     if modo == "Junto al video de origen":
         return src.parent
     base = Path(cfg["outdir"])
-    return base / src.stem if modo == "Subcarpeta por video" else base
+    return base / name if modo == "Subcarpeta por video" else base
 
 
 def already_done(outdir: Path, stem: str) -> int:
@@ -389,12 +879,19 @@ class Renderer:
             self.log("AVISO: con 'copy' el corte salta al keyframe anterior; "
                      "la duración real puede variar.", "warn")
 
+        if cfg["batch"]:
+            names = resolve_names(sources, cfg["nombres"], cfg["keep_year"],
+                                  cfg["overrides"])
+        else:
+            names = [(cfg["name"], "")]
+        prev = self._previous_names(sources, names, cfg)
+
         n = cfg["clips"]
         state = {"done": 0, "total": len(sources) * n, "t0": t0}
         self._emit_progress(state)
 
         tot = {"ok": 0, "fail": 0, "skipped": 0}
-        for i, src in enumerate(sources):
+        for i, (src, (name, note)) in enumerate(zip(sources, names)):
             if self.cancel.is_set():
                 break
             if len(sources) > 1:
@@ -402,7 +899,10 @@ class Renderer:
                 self.log(f"[{i + 1}/{len(sources)}] {src.name}")
             else:
                 self.log(f"Analizando {src.name} ...")
-            res = self._run_source(src, cfg, state)
+            if name != src.stem:
+                self.log(f"  nombre: {name}" + (f"  ({note})" if note else ""),
+                         "warn" if note == "repetido" else "muted")
+            res = self._run_source(src, name, prev[i], cfg, state)
             for k in tot:
                 tot[k] += res[k]
 
@@ -429,16 +929,46 @@ class Renderer:
         self._emit_progress(state)
         return {"ok": 0, "fail": 0, "skipped": 0, key: 1}
 
-    def _run_source(self, src: Path, cfg: dict, state: dict) -> dict:
+    @staticmethod
+    def _previous_names(sources: list[Path], names: list, cfg: dict) -> list[list[str]]:
+        """Por video, los nombres con que pudo exportarse antes: el actual, el
+        de cualquier otro estilo (con su misma resolución de repetidos) y el
+        nombre de archivo tal cual (v0.8 y anteriores). Así 'Omitir ya
+        procesados' sigue funcionando al cambiar de estilo. Se descartan los
+        que en este lote son el nombre actual de otro video."""
+        if not (cfg["batch"] and cfg["skip_done"]):
+            return [[nm] for nm, _ in names]
+        alts = [resolve_names(sources, st, ky, cfg["overrides"])
+                for st in NOMBRES for ky in (False, True)]
+        taken = {nm.lower() for nm, _ in names}
+        out = []
+        for i, src in enumerate(sources):
+            own = names[i][0]
+            cands = [own] + [a[i][0] for a in alts] + [src.stem]
+            keep: list[str] = []
+            for c in cands:
+                if c not in keep and (c.lower() == own.lower()
+                                      or c.lower() not in taken):
+                    keep.append(c)
+            out.append(keep)
+        return out
+
+    def _run_source(self, src: Path, name: str, prev: list, cfg: dict,
+                    state: dict) -> dict:
         n, dur = cfg["clips"], cfg["duration"]
-        outdir = output_dir_for(src, cfg)
+        outdir = output_dir_for(src, name, cfg)
 
         if cfg["batch"] and cfg["skip_done"]:
-            have = already_done(outdir, src.stem)
-            if have:
-                self.log(f"  omitido: {outdir.name} ya tiene {have} clips",
-                         "muted")
-                return self._skip_rest(state, n, "skipped")
+            for old in prev:
+                old_dir = output_dir_for(src, old, cfg)
+                have = already_done(old_dir, old)
+                if have:
+                    extra = ("" if old == name else
+                             "  (nombre anterior)" if old_dir.name == old else
+                             f" como '{old}'")
+                    self.log(f"  omitido: {old_dir.name} ya tiene {have} clips{extra}",
+                             "muted")
+                    return self._skip_rest(state, n, "skipped")
 
         try:
             info = probe(cfg["ffprobe"], str(src))
@@ -478,7 +1008,7 @@ class Renderer:
         ext = src.suffix if cfg["codec"] == "copy" else CODEC_EXT[cfg["codec"]]
         sfx = cfg["suffix"]
         reserved: set = set()
-        paths = [unique_path(outdir / f"{src.stem}_clip_{i + 1}{sfx}{ext}", reserved)
+        paths = [unique_path(outdir / f"{name}_clip_{i + 1}{sfx}{ext}", reserved)
                  for i in range(n)]
 
         ok = fail = 0
@@ -677,10 +1207,19 @@ class App:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.cfg = load_config()
+        # Nombres puestos a mano, por nombre de archivo de origen. Se recuerdan
+        # entre sesiones y también se respetan en modo carpeta.
+        ov = self.cfg.get("name_overrides")
+        self.cfg["name_overrides"] = ({str(k): str(v) for k, v in ov.items()}
+                                      if isinstance(ov, dict) else {})
         self.q: queue.Queue = queue.Queue()
         self.renderer: Renderer | None = None
         self.running = False
+        self.downloader: FFmpegDownloader | None = None
+        self._start_after_dl = False           # Extraer quedó esperando la descarga
         self._probe_job = None
+        self._name_src: str | None = None      # video al que corresponde v_name
+        self._auto_name = ""                   # nombre automático de ese video
 
         self.ffmpeg_dir = tk.StringVar(value=self.cfg.get("ffmpeg_dir", ""))
         self.ffmpeg = find_tool("ffmpeg", self.ffmpeg_dir.get())
@@ -701,6 +1240,7 @@ class App:
         else:
             self.lbl_input.configure(text="Carpeta con videos")
             self.v_probe.set("sin carpeta")
+        self._sync_name_widgets()
         self._refresh_tools_label()
         self._log("randomcutt listo. Elige un video y una carpeta de salida.", "muted")
         self._tick()
@@ -744,6 +1284,10 @@ class App:
         self.v_align = tk.StringVar(value=c.get("align", "crop"))
         self.v_suffix = tk.StringVar(value=c.get("suffix", ""))
         self.v_seed = tk.StringVar(value=c.get("seed", ""))
+        nombres = c.get("nombres", NOMBRES[0])
+        self.v_nombres = tk.StringVar(value=nombres if nombres in NOMBRES else NOMBRES[0])
+        self.v_keep_year = tk.BooleanVar(value=bool(c.get("conservar_anio", False)))
+        self.v_name = tk.StringVar()
         self.v_probe = tk.StringVar(value="sin archivo")
         self.v_status = tk.StringVar(value="listo")
 
@@ -778,6 +1322,9 @@ class App:
         self.lbl_tools = tk.Label(head, text="", bg=C["bg"], fg=C["muted"],
                                   font=(MONO_FONT, 8), anchor="e", justify="right")
         self.lbl_tools.grid(row=0, column=1, sticky="e")
+        self.btn_dl = button(head, "Descargar ffmpeg" if IS_WIN else "Cómo instalar ffmpeg",
+                             self._download_ffmpeg)
+        self.btn_dl.grid(row=0, column=2, sticky="e", padx=(10, 0))
 
         # ---- columnas ---------------------------------------------------
         cols = tk.Frame(root, bg=C["bg"])
@@ -861,12 +1408,45 @@ class App:
                             command=self._probe_later).grid(
                 row=0, column=i, sticky="w", padx=(0, 18))
 
-        tk.Label(b, textvariable=self.v_probe, bg=C["panel"], fg=C["muted"],
-                 font=(MONO_FONT, 8), anchor="w", justify="left", wraplength=840
-                 ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(9, 0))
+        # -- nombre de los clips ---------------------------------------------
+        # Etiquetas en línea, no encima: esta tarjeta ocupa todo el ancho y
+        # cada fila que suma se la quita a la consola en pantallas de 1080.
+        nm = tk.Frame(b, bg=C["panel"])
+        nm.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        nm.columnconfigure(1, weight=1)
+        label(nm, "Nombre de los clips").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        self.ent_name = ttk.Entry(nm, textvariable=self.v_name, style="R.TEntry")
+        self.ent_name.grid(row=0, column=1, sticky="ew")
+        self.btn_auto = button(nm, "Auto", lambda: self.v_name.set(self._auto_name))
+        self.btn_auto.grid(row=0, column=2, padx=(6, 0))
+        # En modo carpeta ocupa el lugar del campo de texto.
+        self.btn_names = button(nm, "Ver nombres en la consola", self._show_names)
+        self.btn_names.grid(row=0, column=1, sticky="w")
+        label(nm, "Estilo").grid(row=0, column=3, sticky="w", padx=(16, 8))
+        cb = ttk.Combobox(nm, textvariable=self.v_nombres, values=NOMBRES,
+                          state="readonly", style="R.TCombobox", width=18)
+        cb.grid(row=0, column=4, sticky="w")
+        cb.bind("<<ComboboxSelected>>", lambda _e: self._on_naming())
+        ttk.Checkbutton(nm, text="Conservar año", variable=self.v_keep_year,
+                        style="R.TCheckbutton", command=self._on_naming).grid(
+            row=0, column=5, sticky="w", padx=(12, 0))
+
+        info = tk.Frame(b, bg=C["panel"])
+        info.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(9, 0))
+        info.columnconfigure(0, weight=1)
+        tk.Label(info, textvariable=self.v_probe, bg=C["panel"], fg=C["muted"],
+                 font=(MONO_FONT, 8), anchor="w", justify="left", wraplength=440
+                 ).grid(row=0, column=0, sticky="nw")
+        self.lbl_name = tk.Label(info, text="", bg=C["panel"], fg=C["muted"],
+                                 font=(UI_FONT, 8), anchor="e", justify="right",
+                                 wraplength=440)
+        self.lbl_name.grid(row=0, column=1, sticky="ne", padx=(12, 0))
         self.v_input.trace_add("write", lambda *_: self._probe_later())
         # El estimado "N clips a generar" depende del número de clips.
         self.v_clips.trace_add("write", lambda *_: self._probe_later())
+        # El ejemplo de nombre depende de lo escrito, del sufijo y del códec.
+        self.v_name.trace_add("write", lambda *_: self._update_name_hint())
+        self.v_suffix.trace_add("write", lambda *_: self._update_name_hint())
         return outer
 
     def _card_cortes(self, parent):
@@ -932,6 +1512,10 @@ class App:
         self.lbl_salida.grid(row=4, column=0, columnspan=3, sticky="w", pady=(7, 0))
 
         label(b, "Códec").grid(row=5, column=0, columnspan=3, sticky="w", pady=(12, 0))
+        # En la línea de "Códec" y no en una fila propia: ahorra alto de ventana.
+        ttk.Checkbutton(b, text="Incluir audio", variable=self.v_audio,
+                        style="R.TCheckbutton").grid(row=5, column=0, columnspan=3,
+                                                     sticky="e", pady=(12, 0))
         cb = ttk.Combobox(b, textvariable=self.v_codec, values=CODECS,
                           state="readonly", style="R.TCombobox")
         cb.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(3, 0))
@@ -941,10 +1525,6 @@ class App:
                                   font=(UI_FONT, 8), anchor="w", justify="left",
                                   wraplength=380)
         self.lbl_codec.grid(row=7, column=0, columnspan=3, sticky="w", pady=(8, 0))
-
-        ttk.Checkbutton(b, text="Incluir audio", variable=self.v_audio,
-                        style="R.TCheckbutton").grid(row=8, column=0, columnspan=3,
-                                                     sticky="w", pady=(10, 0))
         return outer
 
     def _card_avanzado(self, parent):
@@ -1011,7 +1591,21 @@ class App:
             self.frm_batch.grid_remove()
         self.v_input.set("")
         self.v_probe.set("sin carpeta" if batch else "sin archivo")
+        self._sync_name_widgets()
         self._sync_salida()
+
+    def _sync_name_widgets(self):
+        """Archivo: campo editable + Auto. Carpeta: un nombre por video, se
+        revisan en la consola."""
+        if self._is_batch():
+            self.ent_name.grid_remove()
+            self.btn_auto.grid_remove()
+            self.btn_names.grid()
+        else:
+            self.btn_names.grid_remove()
+            self.ent_name.grid()
+            self.btn_auto.grid()
+        self._update_name_hint()
 
     def _sync_salida(self):
         modo = self.v_salida_modo.get()
@@ -1057,14 +1651,159 @@ class App:
         self.w_chunks.configure(state="normal" if is_hap else "disabled")
         for lb in (self.lbl_hapfmt, self.lbl_chunks, self.lbl_align):
             lb.configure(fg=C["muted"] if is_hap else C["border"])
+        self._update_name_hint()                # la extensión del ejemplo cambia
+
+    # -- nombres -----------------------------------------------------------
+    def _on_naming(self):
+        self._refresh_name()
+        if self._is_batch():
+            self._probe_later()                 # la muestra usa los nombres
+
+    def _refresh_name(self):
+        """Recalcula el nombre automático del video elegido (modo Archivo).
+
+        Lo escrito a mano no se pisa al cambiar de estilo: solo se reemplaza
+        si el campo sigue mostrando el automático anterior, o si cambia el
+        video (entonces se carga su nombre guardado, si tiene uno)."""
+        if self._is_batch():
+            return
+        path = self.v_input.get().strip().strip('"')
+        if not path or not os.path.isfile(path):
+            self._name_src, self._auto_name = None, ""
+            self.v_name.set("")
+            return
+        src = Path(path)
+        auto = clip_base_name(src.stem, self.v_nombres.get(), self.v_keep_year.get())
+        cur = self.v_name.get().strip()
+        if str(src) != self._name_src:
+            new = self.cfg["name_overrides"].get(src.name) or auto
+        elif not cur or cur == self._auto_name:
+            new = auto
+        else:
+            new = cur
+        self._name_src, self._auto_name = str(src), auto
+        self.v_name.set(new)
+
+    def _update_name_hint(self):
+        if not hasattr(self, "lbl_name"):
+            return
+        if self._is_batch():
+            self.lbl_name.configure(
+                text="Un nombre por video, según el estilo.\n"
+                     "Los corregidos a mano en modo Archivo se respetan.")
+            return
+        if self._name_src is None:
+            self.lbl_name.configure(text="")
+            return
+        typed = sanitize_name(self.v_name.get())
+        name = typed or self._auto_name
+        manual = bool(typed) and typed != self._auto_name
+        codec = self.v_codec.get()
+        ext = Path(self._name_src).suffix if codec == "copy" else CODEC_EXT.get(codec, "")
+        self.lbl_name.configure(
+            text=f"{name}_clip_1{norm_suffix(self.v_suffix.get())}{ext}\n"
+                 + ("nombre manual, se recuerda para este video" if manual
+                    else "nombre automático"))
+
+    def _show_names(self):
+        """Modo carpeta: vuelca a la consola origen -> nombre de todo el lote."""
+        if self.running:
+            return
+        path = self.v_input.get().strip().strip('"')
+        if not path or not os.path.isdir(path):
+            self._log("Elige primero una carpeta con videos.", "warn")
+            return
+        srcs = collect_sources(path, self.v_recursive.get(), self.v_skip_clips.get())
+        if not srcs:
+            self._log("Ningún video usable en esa carpeta.", "warn")
+            return
+        names = resolve_names(srcs, self.v_nombres.get(), self.v_keep_year.get(),
+                              self.cfg["name_overrides"])
+        self._log("")
+        self._log(f"Nombres para {len(srcs)} videos (estilo {self.v_nombres.get()}"
+                  + (", con año" if self.v_keep_year.get() else "") + "):")
+        width = min(max(len(p.name) for p in srcs), 60)
+        for p, (name, note) in zip(srcs, names):
+            orig = p.name if len(p.name) <= 60 else p.name[:57] + "..."
+            self._log(f"  {orig:<{width}}  ->  {name}" + (f"   [{note}]" if note else ""),
+                      "warn" if note == "repetido" else
+                      "muted" if name == p.stem else "info")
 
     def _refresh_tools_label(self):
+        # Solo se muestra si falta algo: la ruta de ffmpeg no aporta en pantalla.
         if self.ffmpeg and self.ffprobe:
-            self.lbl_tools.configure(text=f"ffmpeg: {self.ffmpeg}", fg=C["muted"])
+            self.lbl_tools.configure(text="")
+            self.btn_dl.grid_remove()
         else:
             missing = ", ".join(n for n, v in (("ffmpeg", self.ffmpeg),
                                                ("ffprobe", self.ffprobe)) if not v)
             self.lbl_tools.configure(text=f"NO ENCONTRADO: {missing}", fg=C["err"])
+            self.btn_dl.grid()
+
+    # -- descarga de ffmpeg ------------------------------------------------
+    def _download_ffmpeg(self, ask: bool = True, then_start: bool = False):
+        if self.running or self.downloader:
+            return
+        if not IS_WIN:
+            messagebox.showinfo(
+                APP_NAME,
+                "Instala ffmpeg con tu gestor de paquetes y vuelve a abrir la app:\n\n"
+                "macOS:  brew install ffmpeg\nLinux:  sudo apt install ffmpeg\n\n"
+                "O indica su carpeta bin en AVANZADO.")
+            return
+        dest = managed_ffmpeg_dir()
+        if ask and not messagebox.askyesno(
+                APP_NAME,
+                "Descargo ffmpeg y ffprobe (build completo de gyan.dev, con HAP, "
+                f"unos 100 MB) en:\n\n{dest}\n\nNo toca el PATH ni el resto del "
+                "sistema. ¿Continuar?"):
+            return
+
+        self._start_after_dl = then_start
+        self.downloader = FFmpegDownloader(self.q)
+        self.btn_go.configure(state="disabled", bg=C["accent_d"])
+        self.btn_dl.configure(state="disabled")
+        self.btn_cancel.configure(state="normal")
+        self.bar.configure(value=0)
+        self.v_status.set("descargando ffmpeg ...")
+        threading.Thread(target=self.downloader.run, daemon=True).start()
+
+    def _dl_finish(self, res: dict):
+        self.downloader = None
+        self.btn_go.configure(state="normal", bg=C["accent"])
+        self.btn_dl.configure(state="normal")
+        self.btn_cancel.configure(state="disabled")
+        start, self._start_after_dl = self._start_after_dl, False
+
+        if res.get("cancelled"):
+            self.bar.configure(value=0)
+            self.v_status.set("descarga cancelada")
+            self._log("Descarga de ffmpeg cancelada.", "warn")
+            return
+        if not res.get("ok"):
+            self.bar.configure(value=0)
+            self.v_status.set("no se pudo descargar ffmpeg")
+            self._log(f"No se pudo descargar ffmpeg: {res.get('error', '')}", "err")
+            messagebox.showerror(
+                APP_NAME,
+                "No se pudo descargar ffmpeg. Revisa la conexión y el detalle en la "
+                "consola.\n\nTambién puedes instalarlo a mano "
+                "(winget install Gyan.FFmpeg) o indicar su carpeta bin en AVANZADO.")
+            return
+
+        self.ffmpeg = find_tool("ffmpeg", self.ffmpeg_dir.get())
+        self.ffprobe = find_tool("ffprobe", self.ffmpeg_dir.get())
+        self._refresh_tools_label()
+        if not (self.ffmpeg and self.ffprobe):             # no debería pasar
+            self._log(f"ffmpeg quedó en {res.get('dir')}, pero no lo encuentro. "
+                      "Indica esa carpeta en AVANZADO.", "err")
+            return
+        self.bar.configure(value=100)
+        self.v_status.set("ffmpeg listo")
+        self._log("ffmpeg listo.", "ok")
+        self._probe_later()                    # la info del video necesita ffprobe
+        if start:
+            self._start(clear_log=False)
 
     # -- acciones ----------------------------------------------------------
     def _pick_input(self):
@@ -1121,6 +1860,7 @@ class App:
     def _probe_input(self):
         self._probe_job = None
         path = self.v_input.get().strip().strip('"')
+        self._refresh_name()
 
         if self._is_batch():
             if not path or not os.path.isdir(path):
@@ -1138,7 +1878,9 @@ class App:
             total = sum(p.stat().st_size for p in srcs)
             peso = (f"{total / (1 << 30):.1f} GB" if total >= (1 << 30)
                     else f"{total / (1 << 20):.0f} MB")
-            muestra = ", ".join(p.stem for p in srcs[:3])
+            names = resolve_names(srcs, self.v_nombres.get(), self.v_keep_year.get(),
+                                  self.cfg["name_overrides"])
+            muestra = ", ".join(nm for nm, _ in names[:3])
             if len(srcs) > 3:
                 muestra += f", +{len(srcs) - 3} más"
             self.v_probe.set(
@@ -1167,10 +1909,16 @@ class App:
 
     def _collect(self) -> dict | None:
         if not self.ffmpeg or not self.ffprobe:
-            messagebox.showerror(
-                APP_NAME,
-                "No encontré ffmpeg / ffprobe.\n\nInstálalos "
-                "(winget install Gyan.FFmpeg) o indica la carpeta bin en AVANZADO.")
+            if IS_WIN:
+                if messagebox.askyesno(
+                        APP_NAME,
+                        "No encontré ffmpeg / ffprobe.\n\n¿Los descargo ahora? Son "
+                        "unos 100 MB y la extracción parte sola al terminar.\n\n"
+                        "Si ya los tienes en otra carpeta, responde No e indica su "
+                        "carpeta bin en AVANZADO."):
+                    self._download_ffmpeg(ask=False, then_start=True)
+            else:
+                self._download_ffmpeg()        # instrucciones para macOS / Linux
             return None
 
         batch = self._is_batch()
@@ -1232,9 +1980,20 @@ class App:
             except ValueError:
                 seed = seed_raw
 
-        sfx = self.v_suffix.get().strip()
-        if sfx and not sfx.startswith(("_", "-", ".")):
-            sfx = "_" + sfx
+        # Nombre: en modo Archivo, lo escrito a mano se guarda para ese video
+        # (y deja de guardarse si vuelve a coincidir con el automático).
+        overrides = self.cfg["name_overrides"]
+        nombres, keep_year = self.v_nombres.get(), bool(self.v_keep_year.get())
+        name = ""
+        if not batch:
+            srcp = Path(src)
+            auto = clip_base_name(srcp.stem, nombres, keep_year)
+            typed = sanitize_name(self.v_name.get())
+            name = typed or auto
+            if typed and typed != auto:
+                overrides[srcp.name] = typed
+            else:
+                overrides.pop(srcp.name, None)
 
         return {
             "ffmpeg": self.ffmpeg, "ffprobe": self.ffprobe,
@@ -1250,17 +2009,27 @@ class App:
             "workers": max(1, min(workers, 16)),
             "hap_format": self.v_hapfmt.get(),
             "hap_chunks": max(1, min(chunks, 64)),
-            "align": self.v_align.get(), "suffix": sfx, "seed": seed,
+            "align": self.v_align.get(), "suffix": norm_suffix(self.v_suffix.get()),
+            "seed": seed,
+            "nombres": nombres, "keep_year": keep_year, "name": name,
+            "overrides": dict(overrides),
         }
 
-    def _start(self):
-        if self.running:
+    def _start(self, clear_log: bool = True):
+        if self.running or self.downloader:
             return
         cfg = self._collect()
         if cfg is None:
             return
+        # Guardar ya, no solo al cerrar: un nombre corregido a mano no se
+        # pierde si la app se cierra mal a mitad de un lote.
+        self._store_cfg()
+        save_config(self.cfg)
 
-        self._clear_log()
+        if clear_log:
+            self._clear_log()
+        else:
+            self._log("")
         self.running = True
         self.btn_go.configure(state="disabled", bg=C["accent_d"])
         self.btn_cancel.configure(state="normal")
@@ -1271,6 +2040,10 @@ class App:
         threading.Thread(target=self.renderer.run, args=(cfg,), daemon=True).start()
 
     def _cancel(self):
+        if self.downloader:
+            self.v_status.set("cancelando descarga ...")
+            self.downloader.cancel.set()
+            return
         if self.renderer and self.running:
             self.v_status.set("cancelando ...")
             self._log("Cancelando ...", "warn")
@@ -1318,6 +2091,17 @@ class App:
                     self.v_status.set(f"{p['done']}/{p['total']} clips{tail}")
                 elif kind == "done":
                     self._finish(msg[1] or {})
+                elif kind == "dl_progress":
+                    p = msg[1]
+                    mb = 1 << 20
+                    if p["total"]:
+                        self.bar.configure(value=p["done"] / p["total"] * 100)
+                        self.v_status.set(f"descargando ffmpeg  {p['done'] / mb:.0f} "
+                                          f"/ {p['total'] / mb:.0f} MB")
+                    else:
+                        self.v_status.set(f"descargando ffmpeg  {p['done'] / mb:.0f} MB")
+                elif kind == "dl_done":
+                    self._dl_finish(msg[1] or {})
         except queue.Empty:
             pass
         self.root.after(80, self._tick)
@@ -1338,8 +2122,18 @@ class App:
         if self.running and not messagebox.askyesno(
                 APP_NAME, "Hay una exportación en curso. ¿Salir igual?"):
             return
+        if self.downloader and not messagebox.askyesno(
+                APP_NAME, "Hay una descarga de ffmpeg en curso. ¿Salir igual?"):
+            return
         if self.renderer:
             self.renderer.abort()
+        if self.downloader:
+            self.downloader.cancel.set()
+        self._store_cfg()
+        save_config(self.cfg)
+        self.root.destroy()
+
+    def _store_cfg(self):
         self.cfg.update({
             "ffmpeg_dir": self.ffmpeg_dir.get(),
             "mode": self.v_mode.get(),
@@ -1360,9 +2154,9 @@ class App:
             "align": self.v_align.get(),
             "suffix": self.v_suffix.get(),
             "seed": self.v_seed.get(),
+            "nombres": self.v_nombres.get(),
+            "conservar_anio": bool(self.v_keep_year.get()),
         })
-        save_config(self.cfg)
-        self.root.destroy()
 
 
 def main():

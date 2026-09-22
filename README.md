@@ -22,15 +22,37 @@ Hace una sola cosa y la hace rápido.
 
 ## Requisitos
 
-**`ffmpeg` y `ffprobe` en el PATH.** Es lo único. En Windows:
+**`ffmpeg` y `ffprobe`.** Es lo único, y en Windows la app puede descargarlos
+sola.
+
+La app los busca al arrancar (PATH, `C:\Program Files\ffmpeg\bin`, el paquete
+de WinGet, junto al `.exe`, o una copia que haya descargado antes). Si los
+tienes en otra ubicación, indica la carpeta `bin` en el campo *Carpeta bin de
+ffmpeg* de la sección AVANZADO.
+
+**Si no los encuentra**, arriba a la derecha aparece `NO ENCONTRADO` en rojo y
+el botón **Descargar ffmpeg**. Al apretar *EXTRAER CLIPS* también ofrece
+descargarlo, y la extracción parte sola al terminar. La descarga:
+
+- Baja el build **full** de [gyan.dev](https://www.gyan.dev/ffmpeg/builds/)
+  (variante *shared*, ~95 MB) desde su release más reciente en GitHub. El build
+  *essentials* no sirve: no trae `libsnappy` y sin eso no hay encoder HAP.
+- Verifica el sha256 que publica GitHub y que el ffmpeg descargado arranque y
+  traiga HAP antes de instalarlo.
+- Lo deja en `%LOCALAPPDATA%\randomcutt\ffmpeg\bin`. No toca el PATH ni el
+  resto del sistema; para desinstalarlo, borra esa carpeta.
+- Si la API de GitHub falla, usa como respaldo el build *gpl-shared* de
+  [BtbN](https://github.com/BtbN/FFmpeg-Builds) (también trae HAP).
+- Se puede cancelar con *Cancelar*.
+
+Si prefieres instalarlo tú, en Windows:
 
 ```powershell
 winget install Gyan.FFmpeg
 ```
 
-La app los busca sola (PATH, `C:\Program Files\ffmpeg\bin`, el paquete de
-WinGet, o junto al `.exe`). Si los tienes en otra ubicación, indica la carpeta
-`bin` en el campo *Carpeta bin de ffmpeg* de la sección AVANZADO.
+En macOS / Linux la app no descarga nada: usa `brew install ffmpeg` o
+`sudo apt install ffmpeg`.
 
 Para ejecutarlo desde el código en vez del `.exe`: Python 3.9+ con `tkinter`.
 No hay dependencias externas.
@@ -41,13 +63,65 @@ python randomcutt_v007.py
 
 ## Uso
 
-1. **ORIGEN** — elige un video (`Archivo`) o una carpeta entera (`Carpeta`).
+1. **ORIGEN** — elige un video (`Archivo`) o una carpeta entera (`Carpeta`), y
+   cómo nombrar los clips.
 2. **CORTES** — cuántos clips y de cuántos segundos (acepta decimales: `0.5`).
 3. **SALIDA** — carpeta destino, cómo organizarla y códec.
 4. **EXTRAER CLIPS**.
 
 Los archivos salen como `<nombre>_clip_<n>.mov`. Nunca sobrescribe nada: si el
 nombre existe, agrega `_1`, `_2`, etc.
+
+### Nombres de los clips
+
+Los nombres de release traen de todo menos el título. randomcutt lo limpia
+antes de nombrar los clips y la subcarpeta:
+
+| Video de origen | Clips |
+|-----------------|-------|
+| `Night.Of.The.Living.Dead.1968.1080p.BluRay.x264-[YTS.AM].mp4` | `Night Of The Living Dead_clip_1.mov` |
+| `A Kite (1998) (BDRip 1440x1076p x265 HEVC FLACx2)(Dual Audio)[sxales].mkv` | `A Kite_clip_1.mov` |
+| `Kite 1998 UNCUT Part 2 DVDRip Dual Audio (ENG+JAP) LKRG.mp4` | `Kite Part 2_clip_1.mov` |
+| `[HorribleSubs] Cowboy Bebop - 05 [1080p].mkv` | `Cowboy Bebop 05_clip_1.mov` |
+| `The.Office.US.S02E03.The.Dundies.720p.WEB-DL.mkv` | `The Office US S02E03_clip_1.mov` |
+| `L.A.Confidential.1997.REMASTERED.1080p.BluRay.mkv` | `L.A. Confidential_clip_1.mov` |
+
+No usa ninguna lista de películas, sino la convención con que se nombran los
+releases (scene, P2P, fansubs): el título va primero y, desde el año, la primera
+etiqueta técnica (`1080p`, `BluRay`, `x264`, `AAC5.1`…) o el marcador de
+episodio, lo que sigue es metadata. Por eso sirve con cualquier nombre, no solo
+con una biblioteca en particular. Algunas reglas:
+
+- Quita corchetes (`[YTS.MX]`, `[Grupo]`, `[ABCD1234]`), sitios `www.…` y el
+  grupo de release.
+- Conserva lo que distingue un archivo de otro: `S02E03`, `1x05`, `- 05` de
+  fansub, `Part 2`, `Vol 1`, `CD 2`.
+- No confunde números del título con años: `Blade Runner 2049`, `1917`,
+  `2001 A Space Odyssey`, `Wonder Woman 1984`.
+- Ediciones y tags (`Remastered`, `Director's Cut`, `Dual Audio`, `Uncut`…) solo
+  se quitan al final del título: `Uncut Gems` se salva.
+- Acepta cualquier alfabeto (`千と千尋の神隠し`, `Häxan`) y unifica los acentos
+  descompuestos que dejan los discos de macOS.
+- El resultado siempre es un nombre de archivo válido: sin `: ? * " |`, sin
+  punto final, sin nombres reservados de Windows (`CON`, `NUL`…) y con un tope
+  de 80 caracteres.
+
+**Estilo:** `Limpio` (`Night Of The Living Dead`), `Limpio sin espacios`
+(`NightOfTheLivingDead`), `snake_case` (`night_of_the_living_dead`) u
+`Original` (el nombre del archivo tal cual, como en v0.8). **Conservar año**
+agrega el año: `Night Of The Living Dead (1968)`.
+
+**Corrección manual.** En modo `Archivo` el nombre aparece en un campo
+editable. Si lo cambias, queda guardado para ese video (por nombre de archivo)
+y se vuelve a usar cada vez que lo proceses, también en modo `Carpeta`. `Auto`
+vuelve al nombre automático y borra el guardado. Sirve para los casos que
+ninguna regla resuelve, como un título que termina en un número con forma de
+año (`Class of 1999` sin año de estreno se leería como `Class of`).
+
+En modo `Carpeta`, **Ver nombres en la consola** muestra `origen -> nombre` de
+todo el lote antes de extraer. Si dos videos terminan con el mismo nombre, el
+segundo recibe `(2)`: si no, compartirían subcarpeta y *Omitir videos ya
+procesados* daría el segundo por hecho.
 
 ### Modo carpeta (lote)
 
@@ -72,7 +146,7 @@ va a generar.
 |--------|----------|
 | **Incluir subcarpetas** | Busca videos también dentro de las subcarpetas. Desactivado por defecto. |
 | **Ignorar archivos `*_clip_*`** | No usa como fuente lo que ya parece un clip generado. Importa si la carpeta mezcla fuentes y clips. |
-| **Omitir videos ya procesados** | Si la carpeta de salida de un video ya tiene clips suyos, lo omite. Puedes detener un lote a la mitad, volver a lanzarlo y continúa donde quedó. |
+| **Omitir videos ya procesados** | Si la carpeta de salida de un video ya tiene clips suyos, lo omite. Puedes detener un lote a la mitad, volver a lanzarlo y continúa donde quedó. Reconoce los clips aunque se hayan hecho con otro estilo de nombre o con una versión anterior. |
 
 También descarta sidecars de macOS (`._nombre.mkv`) y archivos de menos de
 64 KB. Si un video está roto o no se puede leer, lo reporta y sigue con el
@@ -149,9 +223,9 @@ Crea un venv aislado en `.venv-build`, instala PyInstaller ahí y deja
 `dist\randomcutt.exe` (~12 MB). No toca tu Python base. `-Clean` borra todo y
 empieza de cero.
 
-`ffmpeg` **no** se empaqueta (son 200 MB); la app lo busca al arrancar. Si
-quieres una versión totalmente portable, copia `ffmpeg.exe` y `ffprobe.exe` al
-lado del `.exe` y los encontrará.
+`ffmpeg` **no** se empaqueta (son 200 MB); la app lo busca al arrancar y, si no
+está, ofrece descargarlo. Si quieres una versión totalmente portable, copia
+`ffmpeg.exe` y `ffprobe.exe` al lado del `.exe` y los encontrará.
 
 > Si compilas con un Python de Anaconda/Miniconda, el script agrega
 > `Library\bin` al PATH antes de invocar PyInstaller. Sin eso `tcl86t.dll` y
@@ -160,8 +234,11 @@ lado del `.exe` y los encontrará.
 
 ## Configuración
 
-Los parámetros se guardan al cerrar en
-`%LOCALAPPDATA%\randomcutt\config.json` y se restauran al abrir.
+Los parámetros se guardan al cerrar y al lanzar cada extracción en
+`%LOCALAPPDATA%\randomcutt\config.json`, y se restauran al abrir. Ahí también
+quedan los nombres corregidos a mano (`name_overrides`: nombre del archivo de
+origen → nombre de los clips); se pueden editar o borrar a mano con la app
+cerrada.
 
 ## Licencia
 
