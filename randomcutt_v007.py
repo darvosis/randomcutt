@@ -6,8 +6,7 @@ randomcutt - extractor de clips random para VJ / TouchDesigner
 Saca N clips de duración fija desde un video largo y los exporta en HAP
 (u otro códec) para alimentar videocutter / moviefilein en TouchDesigner.
 
-v0.9.0 - nombres limpios para los clips (quita año, resolución, códec, grupo...)
-         y descarga de ffmpeg desde la app si no está instalado.
+v0.10.0 - versión para macOS (.app) y clips sin los metadatos del original.
 Un solo archivo, sin dependencias externas (solo stdlib + ffmpeg/ffprobe).
 """
 
@@ -33,7 +32,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 APP_NAME = "randomcutt"
-APP_VERSION = "0.9.0"
+APP_VERSION = "0.10.0"
 
 VIDEO_TYPES = [
     ("Video", "*.mp4 *.mov *.mkv *.avi *.m4v *.webm *.mpg *.mpeg *.ts *.wmv *.flv"),
@@ -62,15 +61,19 @@ C = {
 }
 
 IS_WIN = os.name == "nt"
+IS_MAC = sys.platform == "darwin"
 UI_FONT = "Segoe UI" if IS_WIN else "Helvetica"
 MONO_FONT = "Consolas" if IS_WIN else "Menlo"
 
-CODECS = ["hap", "prores_ks", "libx264", "h264_nvenc", "copy"]
+# NVENC es solo de NVIDIA; en Mac el H.264 por hardware es VideoToolbox.
+H264_HW = "h264_videotoolbox" if IS_MAC else "h264_nvenc"
+CODECS = ["hap", "prores_ks", "libx264", H264_HW, "copy"]
 CODEC_EXT = {
     "hap": ".mov",
     "prores_ks": ".mov",
     "libx264": ".mp4",
     "h264_nvenc": ".mp4",
+    "h264_videotoolbox": ".mp4",
 }
 HAP_FORMATS = ["hap", "hap_alpha", "hap_q"]
 DISTRIBUCIONES = ["Random puro", "Estratificado", "Lineal"]
@@ -148,7 +151,7 @@ def find_tool(name: str, override_dir: str | None = None) -> str | None:
                     cands += sorted(lap.glob(pat), reverse=True)
                 except OSError:
                     pass
-    elif sys.platform == "darwin":
+    elif IS_MAC:
         # Abierta desde el Finder, la app no hereda el PATH de la terminal.
         cands += [Path("/opt/homebrew/bin") / exe, Path("/usr/local/bin") / exe]
 
@@ -233,6 +236,9 @@ FFMPEG_FALLBACK = ("ffmpeg-master-latest-win64-gpl-shared.zip",
                    "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/"
                    "ffmpeg-master-latest-win64-gpl-shared.zip")
 HTTP_HEADERS = {"User-Agent": f"{APP_NAME}/{APP_VERSION}"}
+# El ffmpeg de Homebrew no trae HAP (se compila sin libsnappy); el del tap
+# homebrew-ffmpeg sí. Choca con el de Homebrew: hay que desinstalar ese antes.
+BREW_HAP_CMD = "brew install homebrew-ffmpeg/ffmpeg/ffmpeg"
 
 
 def managed_ffmpeg_dir() -> Path:
@@ -724,6 +730,14 @@ def clip_base_name(stem: str, style: str, keep_year: bool = False) -> str:
     return name or sanitize_name(stem) or "video"
 
 
+def style_manual(name: str, style: str) -> str:
+    """Un nombre corregido a mano fija el título; el estilo le da formato
+    ("Angel Cop" -> angel_cop / AngelCop). Limpio y Original lo dejan igual."""
+    if style in ("Limpio sin espacios", "snake_case"):
+        return sanitize_name(_render(name.split(), "", "", style, False)) or name
+    return name
+
+
 def resolve_names(sources: list[Path], style: str, keep_year: bool,
                   overrides: dict) -> list[tuple[str, str]]:
     """Nombre final de cada video del lote: (nombre, nota).
@@ -735,7 +749,8 @@ def resolve_names(sources: list[Path], style: str, keep_year: bool,
     out, seen = [], set()
     for src in sources:
         manual = sanitize_name(overrides.get(src.name, ""))
-        base = manual or clip_base_name(src.stem, style, keep_year)
+        base = (style_manual(manual, style) if manual
+                else clip_base_name(src.stem, style, keep_year))
         name, k = base, 2
         while name.lower() in seen:
             name = f"{base} ({k})" if style == "Limpio" else f"{base}_{k}"
@@ -789,6 +804,9 @@ def build_cmd(ffmpeg: str, src: str, start: float, dur: float, out: Path,
         "-i", src,
         "-t", f"{dur:g}",
         "-map", "0:v:0",
+        # Sin esto el clip hereda el título del original (VLC lo muestra en vez
+        # del nombre del archivo) y sus capítulos, como una pista de texto extra.
+        "-map_metadata", "-1", "-map_chapters", "-1",
     ]
     want_audio = cfg["audio"] and info["has_audio"]
     if want_audio:
@@ -812,6 +830,12 @@ def build_cmd(ffmpeg: str, src: str, start: float, dur: float, out: Path,
     elif codec == "h264_nvenc":
         cmd += ["-c:v", "h264_nvenc", "-preset", "p5", "-rc", "vbr",
                 "-cq", "19", "-pix_fmt", "yuv420p"]
+    elif codec == "h264_videotoolbox":
+        # Sin CRF, y su modo de calidad (-q:v) no existe en Macs Intel: bitrate
+        # según resolución, ~12 Mbps en 1080p24.
+        rate = max(2_000_000, int(info["width"] * info["height"]
+                                  * (info["fps"] or 30) * 0.25))
+        cmd += ["-c:v", "h264_videotoolbox", "-b:v", str(rate), "-pix_fmt", "yuv420p"]
     elif codec == "copy":
         cmd += ["-c:v", "copy"]
 
@@ -1070,6 +1094,8 @@ class Renderer:
 # --------------------------------------------------------------------------
 
 def config_file() -> Path:
+    if IS_MAC:
+        return Path.home() / "Library" / "Application Support" / APP_NAME / "config.json"
     base = os.environ.get("LOCALAPPDATA") or os.environ.get("XDG_CONFIG_HOME")
     root = Path(base) if base else Path.home() / ".config"
     return root / APP_NAME / "config.json"
@@ -1122,17 +1148,42 @@ def label(parent, text, **kw):
                     font=(UI_FONT, 9), anchor="w", **kw)
 
 
+class LabelButton(tk.Label):
+    """Botón dibujado sobre un Label. En macOS (Aqua) tk.Button ignora bg y
+    queda blanco con el texto claro del tema: ilegible. Responde a lo mismo
+    que usa la app de tk.Button: state, bg, invoke()."""
+
+    def __init__(self, parent, command, **kw):
+        super().__init__(parent, bd=0, highlightthickness=0,
+                         cursor="pointinghand", **kw)
+        self._command = command
+        self.bind("<ButtonRelease-1>", self._on_release)
+
+    def _on_release(self, e):
+        if 0 <= e.x < self.winfo_width() and 0 <= e.y < self.winfo_height():
+            self.invoke()
+
+    def invoke(self):
+        if str(self["state"]) != "disabled":
+            return self._command()
+
+
 def button(parent, text, command, *, kind="ghost"):
     accent = kind == "accent"
     bg = C["accent"] if accent else C["ghost"]
     hover = C["accent_h"] if accent else C["ghost_h"]
-    b = tk.Button(parent, text=text, command=command,
-                  bg=bg, fg="#ffffff" if accent else C["fg"],
-                  activebackground=hover,
-                  activeforeground="#ffffff" if accent else C["fg"],
-                  relief="flat", bd=0, highlightthickness=0, cursor="hand2",
-                  font=(UI_FONT, 9, "bold" if accent else "normal"),
-                  padx=16 if accent else 12, pady=7 if accent else 4)
+    fg = "#ffffff" if accent else C["fg"]
+    font = (UI_FONT, 9, "bold" if accent else "normal")
+    padx, pady = (16, 7) if accent else (12, 4)
+    if IS_MAC:
+        b = LabelButton(parent, command, text=text, bg=bg, fg=fg, font=font,
+                        padx=padx, pady=pady,
+                        disabledforeground="#f0b3c2" if accent else C["muted"])
+    else:
+        b = tk.Button(parent, text=text, command=command,
+                      bg=bg, fg=fg, activebackground=hover, activeforeground=fg,
+                      relief="flat", bd=0, highlightthickness=0, cursor="hand2",
+                      font=font, padx=padx, pady=pady)
     b.bind("<Enter>", lambda _e: b.configure(bg=hover)
            if str(b["state"]) != "disabled" else None)
     b.bind("<Leave>", lambda _e: b.configure(bg=bg)
@@ -1198,6 +1249,36 @@ def setup_theme(root: tk.Tk):
            arrowcolor=[("disabled", C["border"])],
            bordercolor=[("focus", C["accent"])])
 
+    if IS_MAC:
+        # El fondo por defecto de clam (gris claro) asomaba en las esquinas.
+        st.configure("R.TEntry", background=C["panel"])
+
+
+def mac_fonts(root: tk.Tk):
+    """En Mac, Tk dibuja 1 pt = 1 px (Windows, a 96 dpi, 1,33 px) y 'tk scaling'
+    no cambia las fuentes: todo se veía chico. Sube 2 pt cada fuente ya
+    construida, y los campos y listas, que traían la del sistema (13 pt),
+    pasan a la misma de las etiquetas."""
+    def bigger(spec):
+        family, size, *rest = root.tk.splitlist(spec)
+        return (family, int(size) + 2, *rest)
+
+    def walk(w):
+        for c in w.winfo_children():
+            try:
+                spec = str(c.cget("font"))
+            except tk.TclError:                         # frames, widgets ttk
+                spec = ""
+            if spec and not spec.startswith("Tk"):
+                c.configure(font=bigger(spec))
+            walk(c)
+
+    walk(root)
+    st = ttk.Style(root)
+    st.configure("R.TCheckbutton", font=bigger(st.lookup("R.TCheckbutton", "font")))
+    for name in ("TkDefaultFont", "TkTextFont"):
+        root.tk.call("font", "configure", name, "-family", UI_FONT, "-size", 11)
+
 
 # --------------------------------------------------------------------------
 # App
@@ -1232,6 +1313,8 @@ class App:
 
         self._vars()
         self._build()
+        if IS_MAC:
+            mac_fonts(root)
         self._sync_dist()
         self._sync_codec()
         self._sync_salida()
@@ -1257,10 +1340,22 @@ class App:
         # debajo de la barra de tareas. ~40 px de marco y ~48 de barra.
         x = max(0, (sw - w) // 2)
         y = max(0, (sh - 48 - (h + 40)) // 2)
+        if IS_MAC:
+            # wm maxsize ya descuenta barra de menú, Dock y título. Tk mide la y
+            # desde el borde de la pantalla y la barra de menú mide hasta 38 pt:
+            # arrancar bajo ella y ceder ese alto, esté donde esté el Dock.
+            max_h = min(root.wm_maxsize()[1], sh - 28)
+            avail = max_h - 38
+            h = min(root.winfo_reqheight(), avail)
+            y = max(0, min(sh - max_h - 28, 38) + (avail - h) // 2)
         root.geometry(f"{w}x{h}+{x}+{y}")
         root.minsize(900, min(h, 700))
 
         root.protocol("WM_DELETE_WINDOW", self._on_close)
+        if IS_MAC:
+            # Sin esto, Cmd+Q sale con exit: no guarda el config ni pregunta
+            # por una exportación en curso.
+            root.createcommand("::tk::mac::Quit", self._on_close)
 
     # -- estado ------------------------------------------------------------
     def _vars(self):
@@ -1610,7 +1705,7 @@ class App:
     def _sync_salida(self):
         modo = self.v_salida_modo.get()
         hints = {
-            "Subcarpeta por video": "Cada video a <salida>\\<nombre del video>\\",
+            "Subcarpeta por video": f"Cada video a <salida>{os.sep}<nombre del video>{os.sep}",
             "Todo en una carpeta": "Todos los clips sueltos en la carpeta de salida.",
             "Junto al video de origen": "Al lado de cada video fuente.",
         }
@@ -1641,6 +1736,8 @@ class App:
             "prores_ks": "ProRes HQ (.mov). Decodifica en CPU.",
             "libx264": "H.264 CRF 18 (.mp4). Liviano, pero decodifica en CPU.",
             "h264_nvenc": "H.264 por NVENC (.mp4). El más rápido de exportar.",
+            "h264_videotoolbox": "H.264 por hardware de Apple (.mp4). El más rápido "
+                                 "de exportar.",
             "copy": "Sin recomprimir, misma extensión. Corta solo en keyframes.",
         }
         self.lbl_codec.configure(text=hints.get(codec, ""))
@@ -1696,8 +1793,8 @@ class App:
             self.lbl_name.configure(text="")
             return
         typed = sanitize_name(self.v_name.get())
-        name = typed or self._auto_name
         manual = bool(typed) and typed != self._auto_name
+        name = style_manual(typed, self.v_nombres.get()) if manual else self._auto_name
         codec = self.v_codec.get()
         ext = Path(self._name_src).suffix if codec == "copy" else CODEC_EXT.get(codec, "")
         self.lbl_name.configure(
@@ -1747,8 +1844,10 @@ class App:
         if not IS_WIN:
             messagebox.showinfo(
                 APP_NAME,
-                "Instala ffmpeg con tu gestor de paquetes y vuelve a abrir la app:\n\n"
-                "macOS:  brew install ffmpeg\nLinux:  sudo apt install ffmpeg\n\n"
+                "Instala ffmpeg y vuelve a abrir la app:\n\n"
+                f"macOS:  {BREW_HAP_CMD}\n"
+                "(el ffmpeg normal de Homebrew no trae HAP)\n\n"
+                "Linux:  sudo apt install ffmpeg\n\n"
                 "O indica su carpeta bin en AVANZADO.")
             return
         dest = managed_ffmpeg_dir()
@@ -1836,7 +1935,8 @@ class App:
             self.ffprobe = find_tool("ffprobe", path)
             self._refresh_tools_label()
             self._log(f"ffmpeg: {self.ffmpeg}" if self.ffmpeg
-                      else "Ahí no hay ffmpeg.exe / ffprobe.exe",
+                      else "Ahí no hay ffmpeg.exe / ffprobe.exe" if IS_WIN
+                      else "Ahí no hay ffmpeg / ffprobe",
                       "ok" if self.ffmpeg else "err")
             self._probe_later()
 
@@ -1848,7 +1948,7 @@ class App:
             if IS_WIN:
                 os.startfile(d)                                  # noqa: S606
             else:
-                subprocess.Popen(["open" if sys.platform == "darwin" else "xdg-open", d])
+                subprocess.Popen(["open" if IS_MAC else "xdg-open", d])
         except OSError as exc:
             self._log(f"No se pudo abrir la carpeta: {exc}", "err")
 
@@ -1920,6 +2020,15 @@ class App:
             else:
                 self._download_ffmpeg()        # instrucciones para macOS / Linux
             return None
+        # Fuera de Windows no hay descarga que garantice HAP: sin este aviso,
+        # cada clip fallaría con "Unknown encoder".
+        if not IS_WIN and self.v_codec.get() == "hap" and not has_hap_encoder(self.ffmpeg):
+            messagebox.showerror(
+                APP_NAME,
+                f"Este ffmpeg no trae el encoder HAP:\n{self.ffmpeg}\n\n"
+                "Elige otro códec, o en macOS instala uno con HAP:\n\n"
+                f"brew uninstall ffmpeg\n{BREW_HAP_CMD}")
+            return None
 
         batch = self._is_batch()
         src = self.v_input.get().strip().strip('"')
@@ -1989,9 +2098,10 @@ class App:
             srcp = Path(src)
             auto = clip_base_name(srcp.stem, nombres, keep_year)
             typed = sanitize_name(self.v_name.get())
-            name = typed or auto
+            name = auto
             if typed and typed != auto:
                 overrides[srcp.name] = typed
+                name = style_manual(typed, nombres)
             else:
                 overrides.pop(srcp.name, None)
 

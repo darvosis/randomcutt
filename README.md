@@ -17,7 +17,10 @@ Hace una sola cosa y la hace rápido.
 - Corta con `ffmpeg` usando *input seek* (`-ss` antes de `-i`): salta al punto
   sin decodificar todo lo anterior, así que el tiempo no depende de cuán
   adentro del video caiga el corte.
-- Exporta en HAP, ProRes, H.264 (CPU o NVENC) o copia el stream sin recomprimir.
+- Exporta en HAP, ProRes, H.264 (CPU, NVENC o VideoToolbox en Mac) o copia el
+  stream sin recomprimir.
+- Los clips no heredan los metadatos del original (título, capítulos): los
+  reproductores muestran el nombre del archivo.
 - Ejecuta varios `ffmpeg` en paralelo.
 
 ## Requisitos
@@ -51,11 +54,26 @@ Si prefieres instalarlo tú, en Windows:
 winget install Gyan.FFmpeg
 ```
 
-En macOS / Linux la app no descarga nada: usa `brew install ffmpeg` o
-`sudo apt install ffmpeg`.
+**En macOS** la app no descarga nada. Instálalo con [Homebrew](https://brew.sh),
+pero **no** con `brew install ffmpeg`: ese se compila sin `libsnappy` y no trae
+el encoder HAP. El del tap `homebrew-ffmpeg` sí:
+
+```bash
+brew install homebrew-ffmpeg/ffmpeg/ffmpeg
+```
+
+Si ya tenías el ffmpeg normal de Homebrew, desinstálalo antes
+(`brew uninstall ffmpeg`), porque los dos chocan. El tap no trae una versión
+precompilada: ffmpeg se compila en tu Mac (menos de dos minutos en un M2). La
+app lo busca en `/opt/homebrew/bin` y `/usr/local/bin` aunque la abras desde el
+Finder, y si eliges HAP con un ffmpeg que no lo trae, avisa antes de extraer.
+
+En Linux: `sudo apt install ffmpeg`.
 
 Para ejecutarlo desde el código en vez del `.exe`: Python 3.9+ con `tkinter`.
-No hay dependencias externas.
+No hay dependencias externas. En macOS usa el Python de
+[python.org](https://www.python.org/downloads/macos/), que trae Tk 8.6; el
+`/usr/bin/python3` del sistema trae Tk 8.5.
 
 ```bash
 python randomcutt_v007.py
@@ -114,7 +132,9 @@ agrega el año: `Night Of The Living Dead (1968)`.
 **Corrección manual.** En modo `Archivo` el nombre aparece en un campo
 editable. Si lo cambias, queda guardado para ese video (por nombre de archivo)
 y se vuelve a usar cada vez que lo proceses, también en modo `Carpeta`. `Auto`
-vuelve al nombre automático y borra el guardado. Sirve para los casos que
+vuelve al nombre automático y borra el guardado. El estilo también se aplica al
+nombre corregido: `Angel Cop` sale como `angel_cop` en `snake_case` y como
+`AngelCop` en `Limpio sin espacios`. Sirve para los casos que
 ninguna regla resuelve, como un título que termina en un número con forma de
 año (`Class of 1999` sin año de estreno se leería como `Class of`).
 
@@ -183,6 +203,7 @@ mismos parámetros = exactamente los mismos cortes.
 | `prores_ks` | `.mov` | ProRes HQ. Decodifica en CPU. |
 | `libx264` | `.mp4` | CRF 18, yuv420p. Liviano en disco. |
 | `h264_nvenc` | `.mp4` | H.264 por GPU (NVIDIA). El más rápido de exportar. |
+| `h264_videotoolbox` | `.mp4` | Solo en macOS, en lugar de `h264_nvenc`: H.264 por el hardware de Apple. |
 | `copy` | igual que el origen | Sin recomprimir. Solo corta en keyframes, la duración real puede variar. |
 
 **Variantes HAP:** `hap` (DXT1, el más liviano), `hap_q` (mejor calidad, ~70%
@@ -227,6 +248,29 @@ empieza de cero.
 está, ofrece descargarlo. Si quieres una versión totalmente portable, copia
 `ffmpeg.exe` y `ffprobe.exe` al lado del `.exe` y los encontrará.
 
+### macOS
+
+```bash
+./build_app.sh              # app para este Mac (arm64 en M1/M2)
+./build_app.sh --universal  # una sola app para Apple Silicon e Intel
+```
+
+Necesita el Python de python.org. Igual que en Windows, usa un venv aislado en
+`.venv-build` y `--clean` borra todo y empieza de cero. Deja
+`dist/randomcutt.app` (28 MB; 49 MB la universal) y un `.zip` para el release,
+`dist/randomcutt-macos-arm64.zip` o `-universal.zip`, hecho con `ditto` porque
+`zip` rompe los permisos y los symlinks del bundle. ffmpeg tampoco se empaqueta.
+
+La app no va firmada. Si la bajas de GitHub, macOS la bloquea la primera vez.
+Desde macOS 15 ya no sirve clic derecho → Abrir: intenta abrirla una vez, ve a
+*Ajustes del Sistema → Privacidad y seguridad* (*System Settings → Privacy &
+Security*) y autorízala con el botón *Open Anyway* que aparece al final. O
+quítale la cuarentena:
+
+```bash
+xattr -dr com.apple.quarantine randomcutt.app
+```
+
 > Si compilas con un Python de Anaconda/Miniconda, el script agrega
 > `Library\bin` al PATH antes de invocar PyInstaller. Sin eso `tcl86t.dll` y
 > `tk86t.dll` no se empaquetan y el `.exe` muere con
@@ -235,7 +279,9 @@ está, ofrece descargarlo. Si quieres una versión totalmente portable, copia
 ## Configuración
 
 Los parámetros se guardan al cerrar y al lanzar cada extracción en
-`%LOCALAPPDATA%\randomcutt\config.json`, y se restauran al abrir. Ahí también
+`%LOCALAPPDATA%\randomcutt\config.json` (en macOS,
+`~/Library/Application Support/randomcutt/config.json`), y se restauran al
+abrir. Ahí también
 quedan los nombres corregidos a mano (`name_overrides`: nombre del archivo de
 origen → nombre de los clips); se pueden editar o borrar a mano con la app
 cerrada.
